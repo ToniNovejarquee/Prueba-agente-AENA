@@ -1,0 +1,409 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SEGMENTO AENA - aena-agente  (ruta ${poc.rutas.aena.agente})  ("Agente AENA · A2A + LLM" del diagrama)
+  Agente de AENA expuesto por A2A (protocolo v1, bindings JSON-RPC y HTTP+JSON). Lo invoca el agente de la aerolínea.
+    1. Interpreta la solicitud: DataPart JSON {accion, argumentos} (lo normal) o texto libre.
+    2. Pide al LLM (Ollama, conector Inference) que use las tools de los tres MCP bridges de AENA
+       (vuelos, parking y pagos): el LLM decide la tool y el conector la ejecuta vía MCP.
+    3. Salvaguarda: si el LLM falla o no ejecuta la tool, se invoca la tool directamente (origenCalculo FALLBACK_TOOL_DIRECTA).
+       Con aena.agente.usarLlm=false se invoca siempre directamente (origenCalculo TOOL_DIRECTA).
+    4. Publica el resultado como artifact "resultado-aena" y cierra la Task como COMPLETED (o REJECTED / FAILED).
+  Acciones (= nombre de la tool): buscar_vuelos, consultar_vuelo, buscar_parking, reservar_parking, crear_pago, estado_pago.
+  Agent Card: http://localhost:8081/aena/agente/.well-known/agent-card.json
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+	xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+	xmlns:ms-inference="http://www.mulesoft.org/schema/mule/ms-inference"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd
+http://www.mulesoft.org/schema/mule/ms-inference http://www.mulesoft.org/schema/mule/ms-inference/current/mule-ms-inference.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!-- Servidor A2A + Agent Card -->
+	<a2a:server-config name="aena-agente-a2a-server" doc:name="A2A Server AENA">
+		<a2a:connection listenerConfig="poc-http-listener" agentPath="${poc.rutas.aena.agente}">
+			<a2a:interfaces>
+				<a2a:interface protocol="JSONRPC" path="/rpc" />
+				<a2a:interface protocol="HTTP_JSON" path="/" />
+			</a2a:interfaces>
+		</a2a:connection>
+		<a2a:agent-card>
+			<a2a:json><![CDATA[{
+  "name": "${aena.agente.nombre}",
+  "description": "Agente de AENA para aerolíneas: busca vuelos, reserva parking en los aeropuertos de AENA y gestiona pagos con la pasarela. Razona con un LLM y ejecuta las tools de sus servidores MCP (vuelos, parking y pagos).",
+  "version": "${aena.agente.version}",
+  "protocolVersion": "1.0",
+  "provider": { "organization": "${aena.agente.organizacion}", "url": "https://www.aena.es" },
+  "supportedInterfaces": [
+    { "protocolBinding": "JSONRPC",   "url": "${poc.urlPublica}${poc.rutas.aena.agente}/rpc", "protocolVersion": "1.0", "tenant": "" },
+    { "protocolBinding": "HTTP+JSON", "url": "${poc.urlPublica}${poc.rutas.aena.agente}",     "protocolVersion": "1.0", "tenant": "" }
+  ],
+  "capabilities": { "streaming": false, "pushNotifications": false, "extendedAgentCard": false },
+  "securitySchemes": {
+    "apiKey": { "apiKeySecurityScheme": { "location": "header", "name": "X-API-Key", "description": "API key de la POC (cabecera X-API-Key)" } }
+  },
+  "securityRequirements": [ { "schemes": { "apiKey": { "list": [] } } } ],
+  "skills": [
+    {
+      "id": "servicios-aeroportuarios",
+      "name": "Vuelos, parking y pagos AENA",
+      "description": "Entrada recomendada: DataPart JSON {accion, argumentos}. Acciones: buscar_vuelos {origen, destino, fecha, pasajeros}, consultar_vuelo {vueloId, pasajeros}, buscar_parking {aeropuerto, fechaEntrada, fechaSalida}, reservar_parking {aeropuerto, opcionId, fechaEntrada, fechaSalida, matricula, referencia}, crear_pago {referencia, importe, concepto}, estado_pago {idPago}. También acepta texto libre. Salida: artifact 'resultado-aena' con un JSON {tipo, ...}.",
+      "tags": ["aena", "vuelos", "parking", "pagos", "aeropuerto"],
+      "examples": [
+        "Busca vuelos de Madrid a Londres el 2026-11-20 para 2 pasajeros",
+        "¿Qué parking hay en Barajas del 20 al 27 de noviembre?"
+      ],
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["application/json", "text/plain"]
+    }
+  ],
+  "defaultInputModes": ["application/json", "text/plain"],
+  "defaultOutputModes": ["application/json", "text/plain"]
+}]]></a2a:json>
+		</a2a:agent-card>
+	</a2a:server-config>
+
+	<!-- Clientes MCP hacia los tres MCP bridges de AENA (nombres sin guiones: el LLM ve las tools como <config>__<tool>) -->
+	<mcp:client-config name="aena_vuelos" doc:name="MCP Client vuelos" clientName="aena-agente" clientVersion="${aena.agente.version}">
+		<mcp:streamable-http-client-connection serverUrl="http://${poc.host}:${poc.http.puerto}" mcpEndpointPath="${poc.rutas.aena.mcpVuelos}" requestTimeout="${poc.timeouts.mcpSegundos}">
+			<mcp:default-request-headers>
+				<mcp:default-request-header key="X-API-Key" value="${poc.seguridad.apiKey}" />
+			</mcp:default-request-headers>
+		</mcp:streamable-http-client-connection>
+	</mcp:client-config>
+	<mcp:client-config name="aena_parking" doc:name="MCP Client parking" clientName="aena-agente" clientVersion="${aena.agente.version}">
+		<mcp:streamable-http-client-connection serverUrl="http://${poc.host}:${poc.http.puerto}" mcpEndpointPath="${poc.rutas.aena.mcpParking}" requestTimeout="${poc.timeouts.mcpSegundos}">
+			<mcp:default-request-headers>
+				<mcp:default-request-header key="X-API-Key" value="${poc.seguridad.apiKey}" />
+			</mcp:default-request-headers>
+		</mcp:streamable-http-client-connection>
+	</mcp:client-config>
+	<mcp:client-config name="aena_pagos" doc:name="MCP Client pagos" clientName="aena-agente" clientVersion="${aena.agente.version}">
+		<mcp:streamable-http-client-connection serverUrl="http://${poc.host}:${poc.http.puerto}" mcpEndpointPath="${poc.rutas.aena.mcpPagos}" requestTimeout="${poc.timeouts.mcpSegundos}">
+			<mcp:default-request-headers>
+				<mcp:default-request-header key="X-API-Key" value="${poc.seguridad.apiKey}" />
+			</mcp:default-request-headers>
+		</mcp:streamable-http-client-connection>
+	</mcp:client-config>
+
+	<!-- LLM: Ollama Cloud a través del conector MuleSoft Inference -->
+	<ms-inference:text-generation-config name="aena-llm-config" doc:name="LLM Ollama AENA">
+		<ms-inference:ollama-connection ollamaModelName="${poc.llm.modelo}" ollamaUrl="${poc.llm.url}" apiKey="${poc.llm.apiKey}" timeout="${poc.timeouts.llmSegundos}" maxTokens="${poc.llm.maxTokens}" temperature="${poc.llm.temperatura}" />
+	</ms-inference:text-generation-config>
+
+	<!-- ============================================================================================ -->
+	<!-- Task Listener A2A                                                                             -->
+	<!-- ============================================================================================ -->
+	<flow name="aena-agente-task-listener">
+		<a2a:task-listener doc:name="A2A Task Listener" config-ref="aena-agente-a2a-server" />
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aena-agente', dominio: 'AENA'}]" />
+
+		<ee:transform doc:name="Contexto A2A y trazabilidad">
+			<ee:variables>
+				<ee:set-variable variableName="cabecerasEntrada"><![CDATA[%dw 2.0
+output application/java
+---
+attributes.headers]]></ee:set-variable>
+				<ee:set-variable variableName="correlationIdEntrante"><![CDATA[%dw 2.0
+output application/java
+---
+payload.message.metadata.correlationId default null]]></ee:set-variable>
+				<ee:set-variable variableName="a2aCtx"><![CDATA[%dw 2.0
+output application/java
+---
+{taskId: attributes.taskId, contextId: attributes.contextId, operacion: (attributes.operationName default "") as String}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="a2a-task-recibida" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Tarea A2A recibida', datos: {remitente: attributes.remoteAddress, cabeceras: attributes.headers, mensaje: payload.message}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<!-- Seguridad: SendMessage solo con la API key de la POC. Si falta o no es válida, la Task se cierra como REJECTED -->
+		<set-variable doc:name="Paso" variableName="pasoActual" value="seguridad" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+
+		<!-- 1. Interpretar la solicitud -->
+		<set-variable doc:name="Paso" variableName="pasoActual" value="interpretar-solicitud" />
+		<ee:transform doc:name="Extraer solicitud">
+			<ee:variables>
+				<ee:set-variable variableName="solicitud"><![CDATA[%dw 2.0
+output application/java
+import try from dw::Runtime
+var partes = payload.message.parts default []
+var desdeData = (partes filter ($.data != null))[0].data
+var desdeTexto = ((partes filter ($.text != null)) map try(() -> read($.text, "application/json")) filter ($.success and ($.result is Object)) map $.result)[0]
+---
+desdeData default desdeTexto]]></ee:set-variable>
+				<ee:set-variable variableName="textoSolicitud"><![CDATA[%dw 2.0
+output application/java
+---
+((payload.message.parts default []) filter ($.text != null) map $.text) joinBy "\n"]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<ee:transform doc:name="Acción y argumentos">
+			<ee:variables>
+				<ee:set-variable variableName="accion"><![CDATA[%dw 2.0
+output application/java
+---
+lower(trim((vars.solicitud.accion default "") as String))]]></ee:set-variable>
+				<ee:set-variable variableName="argumentos"><![CDATA[%dw 2.0
+import mergeWith from dw::core::Objects
+output application/java
+---
+((vars.solicitud.argumentos default {}) as Object) mergeWith {correlationId: vars.correlationId}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<set-variable doc:name="Log DECISION" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'DECISION', mensaje: if (vars.accion != '') ('Solicitud estructurada: ' ++ vars.accion) else 'Solicitud en texto libre: el LLM decidirá la tool', datos: {accion: vars.accion, argumentos: vars.argumentos, texto: vars.textoSolicitud}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<choice doc:name="¿Solicitud válida?">
+			<when expression="#[vars.accion != '' and not (['buscar_vuelos', 'consultar_vuelo', 'buscar_parking', 'reservar_parking', 'crear_pago', 'estado_pago'] contains vars.accion)]">
+				<raise-error doc:name="Acción no soportada" type="AENA:ACCION_NO_SOPORTADA" description="#['Acción no soportada por el agente de AENA: ' ++ vars.accion ++ '. Acciones: buscar_vuelos, consultar_vuelo, buscar_parking, reservar_parking, crear_pago, estado_pago']" />
+			</when>
+			<when expression="#[vars.accion == '' and (isEmpty(vars.textoSolicitud) or p('aena.agente.usarLlm') != 'true')]">
+				<raise-error doc:name="Solicitud vacía" type="AENA:SOLICITUD_NO_VALIDA" description="La solicitud debe traer un DataPart {accion, argumentos} (o texto libre si el LLM está activado)" />
+			</when>
+		</choice>
+		<set-variable doc:name="Sin resultado" variableName="resultado" value="#[null]" />
+		<set-variable doc:name="Origen" variableName="origenCalculo" value="TOOL_DIRECTA" />
+
+		<!-- 2. LLM + tools MCP (vuelos, parking y pagos) -->
+		<choice doc:name="¿Usar LLM?">
+			<when expression="#[p('aena.agente.usarLlm') == 'true']">
+				<set-variable doc:name="Paso" variableName="pasoActual" value="llm-mcp-tooling" />
+				<set-variable doc:name="Entrada LLM" variableName="entradaLlm" value="#[if (vars.accion != '') write({accion: vars.accion, argumentos: vars.argumentos}, 'application/json') else (vars.textoSolicitud ++ ' (correlationId: ' ++ vars.correlationId ++ ')')]" />
+				<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'LLAMADA_SALIENTE', mensaje: 'Consulta al LLM con las tools de los MCP de AENA', datos: {proveedor: p('poc.llm.proveedor'), url: p('poc.llm.url'), modelo: p('poc.llm.modelo'), entrada: vars.entradaLlm}}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+				<try doc:name="LLM con reintento">
+					<until-successful doc:name="Reintentos LLM" maxRetries="${aena.agente.reintentosLlm}" millisBetweenRetries="500">
+						<ms-inference:mcp-tools-native-template doc:name="[MCP] Tooling" config-ref="aena-llm-config" target="respuestaLlm" targetValue="#[output application/java --- {respuesta: payload, atributos: attributes}]">
+							<ms-inference:mcp-config-references>
+								<ms-inference:mcp-config mcpClientConfigRef="aena_vuelos" />
+								<ms-inference:mcp-config mcpClientConfigRef="aena_parking" />
+								<ms-inference:mcp-config mcpClientConfigRef="aena_pagos" />
+							</ms-inference:mcp-config-references>
+							<ms-inference:template><![CDATA[Eres el agente de AENA (gestor de aeropuertos de España). Atiendes peticiones de agentes de aerolíneas sobre vuelos, parking en los aeropuertos de AENA y pagos con la pasarela, usando SIEMPRE las herramientas disponibles.]]></ms-inference:template>
+							<ms-inference:instructions><![CDATA[Si la solicitud es un JSON con "accion" y "argumentos": invoca UNA sola herramienta, la que tiene el mismo nombre que "accion", pasándole como argumentos el objeto "argumentos" tal cual (mismas claves y mismos valores, incluido correlationId). Si la solicitud es texto libre: deduce la herramienta adecuada y sus argumentos (fechas en formato AAAA-MM-DD, aeropuertos por código IATA) e invócala una sola vez, pasando también el correlationId recibido. Nunca inventes datos que no estén en la solicitud y nunca respondas sin usar una herramienta.]]></ms-inference:instructions>
+							<ms-inference:data><![CDATA[#[vars.entradaLlm]]]></ms-inference:data>
+						</ms-inference:mcp-tools-native-template>
+					</until-successful>
+					<error-handler>
+						<on-error-continue type="ANY" logException="false">
+							<set-variable doc:name="Log WARN" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'WARN', paso: vars.pasoActual, fase: 'RESPUESTA', mensaje: 'El LLM no completó la llamada a la tool tras los reintentos', datos: {tipoError: (error.errorType.namespace default '') ++ ':' ++ (error.errorType.identifier default ''), descripcion: error.description, pista: 'Mira el ERROR previo del conector com.mulesoft.connectors.inference: 401 = API key de Ollama no válida (poc.llm.apiKey); PKIX = certificado TLS no confiable (con proxy corporativo falta -Djavax.net.ssl.trustStoreType=Windows-ROOT)'}}]" />
+							<flow-ref doc:name="poc-log" name="poc-log" />
+							<set-variable doc:name="Sin respuesta LLM" variableName="respuestaLlm" value="#[null]" />
+						</on-error-continue>
+					</error-handler>
+				</try>
+				<ee:transform doc:name="Resultado del LLM">
+					<ee:variables>
+						<ee:set-variable variableName="resultado"><![CDATA[%dw 2.0
+output application/java
+import * from dwl::comun::utilidades
+var r = vars.respuestaLlm.respuesta
+---
+if (r == null) null
+else if (vars.accion != "") resultadoToolLlm(r, vars.accion)
+else resultadoNegocio((r.toolsExecutionReport default []) map $.result)]]></ee:set-variable>
+						<ee:set-variable variableName="toolsLlm"><![CDATA[%dw 2.0
+output application/java
+import * from dwl::comun::utilidades
+---
+if (vars.respuestaLlm == null) [] else toolsEjecutadas(vars.respuestaLlm.respuesta)]]></ee:set-variable>
+					</ee:variables>
+				</ee:transform>
+				<set-variable doc:name="Origen" variableName="origenCalculo" value="LLM_MCP" />
+				<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'RESPUESTA', mensaje: 'Respuesta del LLM: tools decididas y resultado de su ejecución vía MCP', datos: {toolsEjecutadasPorLlm: vars.toolsLlm, resultado: vars.resultado, textoLlm: vars.respuestaLlm.respuesta.response default null, consumoTokens: vars.respuestaLlm.atributos.tokenUsage default null}}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+			</when>
+		</choice>
+
+		<!-- 3. Salvaguarda: si no hay resultado, se invoca la tool directamente y se deja constancia -->
+		<choice doc:name="¿Resultado obtenido?">
+			<when expression="#[vars.resultado == null and vars.accion != '' and (p('aena.agente.usarLlm') != 'true' or p('aena.agente.fallbackDeterminista') == 'true')]">
+				<set-variable doc:name="Paso" variableName="pasoActual" value="tool-directa" />
+				<set-variable doc:name="Origen" variableName="origenCalculo" value="#[if (p('aena.agente.usarLlm') == 'true') 'FALLBACK_TOOL_DIRECTA' else 'TOOL_DIRECTA']" />
+				<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: if (vars.origenCalculo == 'FALLBACK_TOOL_DIRECTA') 'WARN' else 'INFO', paso: vars.pasoActual, fase: 'LLAMADA_SALIENTE', mensaje: 'MCP call-tool ' ++ vars.accion ++ (if (vars.origenCalculo == 'FALLBACK_TOOL_DIRECTA') ' (el LLM no devolvió resultado)' else ''), datos: vars.argumentos}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+				<choice doc:name="Tool">
+					<when expression="#[vars.accion == 'buscar_vuelos']">
+						<mcp:call-tool doc:name="buscar_vuelos" config-ref="aena_vuelos" toolName="buscar_vuelos" extractStructuredContent="true" target="respuestaTool">
+							<mcp:arguments><![CDATA[#[output application/java --- vars.argumentos]]]></mcp:arguments>
+							<mcp:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></mcp:additional-properties>
+						</mcp:call-tool>
+					</when>
+					<when expression="#[vars.accion == 'consultar_vuelo']">
+						<mcp:call-tool doc:name="consultar_vuelo" config-ref="aena_vuelos" toolName="consultar_vuelo" extractStructuredContent="true" target="respuestaTool">
+							<mcp:arguments><![CDATA[#[output application/java --- vars.argumentos]]]></mcp:arguments>
+							<mcp:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></mcp:additional-properties>
+						</mcp:call-tool>
+					</when>
+					<when expression="#[vars.accion == 'buscar_parking']">
+						<mcp:call-tool doc:name="buscar_parking" config-ref="aena_parking" toolName="buscar_parking" extractStructuredContent="true" target="respuestaTool">
+							<mcp:arguments><![CDATA[#[output application/java --- vars.argumentos]]]></mcp:arguments>
+							<mcp:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></mcp:additional-properties>
+						</mcp:call-tool>
+					</when>
+					<when expression="#[vars.accion == 'reservar_parking']">
+						<mcp:call-tool doc:name="reservar_parking" config-ref="aena_parking" toolName="reservar_parking" extractStructuredContent="true" target="respuestaTool">
+							<mcp:arguments><![CDATA[#[output application/java --- vars.argumentos]]]></mcp:arguments>
+							<mcp:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></mcp:additional-properties>
+						</mcp:call-tool>
+					</when>
+					<when expression="#[vars.accion == 'crear_pago']">
+						<mcp:call-tool doc:name="crear_pago" config-ref="aena_pagos" toolName="crear_pago" extractStructuredContent="true" target="respuestaTool">
+							<mcp:arguments><![CDATA[#[output application/java --- vars.argumentos]]]></mcp:arguments>
+							<mcp:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></mcp:additional-properties>
+						</mcp:call-tool>
+					</when>
+					<otherwise>
+						<mcp:call-tool doc:name="estado_pago" config-ref="aena_pagos" toolName="estado_pago" extractStructuredContent="true" target="respuestaTool">
+							<mcp:arguments><![CDATA[#[output application/java --- vars.argumentos]]]></mcp:arguments>
+							<mcp:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></mcp:additional-properties>
+						</mcp:call-tool>
+					</otherwise>
+				</choice>
+				<ee:transform doc:name="Resultado de la tool">
+					<ee:variables>
+						<ee:set-variable variableName="resultado"><![CDATA[%dw 2.0
+output application/java
+import * from dwl::comun::utilidades
+---
+resultadoNegocio(vars.respuestaTool)]]></ee:set-variable>
+					</ee:variables>
+				</ee:transform>
+				<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'RESPUESTA', mensaje: 'Resultado de la tool ' ++ vars.accion, datos: vars.resultado}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+			</when>
+		</choice>
+		<choice doc:name="¿Hay resultado?">
+			<when expression="#[vars.resultado == null]">
+				<raise-error doc:name="Sin resultado" type="AENA:SIN_RESULTADO" description="#['No se ha obtenido resultado de las tools de AENA para la acción ' ++ (if (vars.accion == '') 'deducida del texto' else vars.accion)]" />
+			</when>
+		</choice>
+
+		<!-- 4. Respuesta A2A: el conector 2.x emite la respuesta al publicar un estado terminal -->
+		<set-variable doc:name="Paso" variableName="pasoActual" value="responder-task" />
+		<ee:transform doc:name="Construir Task">
+			<ee:variables>
+				<ee:set-variable variableName="taskRespuesta"><![CDATA[%dw 2.0
+output application/json skipNullOn="everywhere"
+var r = vars.resultado
+var resumen = if (r.tipo == "error") ("AENA no ha podido completar la acción: " ++ ((r.mensaje default r.codigo default "error") as String))
+              else ("AENA ha completado la acción " ++ (if (vars.accion == "") "solicitada" else vars.accion) ++ " (resultado de tipo " ++ (r.tipo as String) ++ ").")
+---
+{
+    status: {
+        state: "TASK_STATE_COMPLETED",
+        message: {role: "ROLE_AGENT", messageId: uuid(), parts: [{text: resumen}]}
+    },
+    artifact: {
+        artifactId: uuid(),
+        name: "resultado-aena",
+        description: "Resultado de la acción solicitada a AENA",
+        parts: [
+            {data: r, mediaType: "application/json"},
+            {text: resumen}
+        ]
+    },
+    metadata: {
+        correlationId: vars.correlationId,
+        accion: vars.accion,
+        origenCalculo: vars.origenCalculo,
+        modeloLlm: if (p('aena.agente.usarLlm') == 'true') p('poc.llm.modelo') else null
+    }
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<a2a:update-task-artifact doc:name="Artifact resultado-aena" config-ref="aena-agente-a2a-server">
+			<a2a:artifact-content><![CDATA[#[output application/json skipNullOn="everywhere" --- {artifactUpdate: {taskId: vars.a2aCtx.taskId, contextId: vars.a2aCtx.contextId, artifact: vars.taskRespuesta.artifact}}]]]></a2a:artifact-content>
+		</a2a:update-task-artifact>
+		<a2a:set-task-metadata doc:name="Metadata de trazabilidad" config-ref="aena-agente-a2a-server" taskId="#[vars.a2aCtx.taskId]">
+			<a2a:metadata><![CDATA[#[output application/json --- vars.taskRespuesta.metadata]]]></a2a:metadata>
+		</a2a:set-task-metadata>
+		<set-variable doc:name="Log FIN" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'FIN', mensaje: 'Task A2A completada', datos: {accion: vars.accion, origenCalculo: vars.origenCalculo, tipoResultado: vars.resultado.tipo}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<a2a:update-task-status doc:name="Estado COMPLETED" config-ref="aena-agente-a2a-server">
+			<a2a:status-content><![CDATA[#[output application/json --- {statusUpdate: {taskId: vars.a2aCtx.taskId, contextId: vars.a2aCtx.contextId, status: vars.taskRespuesta.status}}]]]></a2a:status-content>
+		</a2a:update-task-status>
+
+		<error-handler>
+			<on-error-continue type="POC:NO_AUTORIZADO" logException="false">
+				<a2a:update-task-status doc:name="Estado REJECTED" config-ref="aena-agente-a2a-server">
+					<a2a:status-content><![CDATA[#[%dw 2.0
+output application/json
+---
+{
+    statusUpdate: {
+        taskId: vars.a2aCtx.taskId,
+        contextId: vars.a2aCtx.contextId,
+        status: {
+            state: "TASK_STATE_REJECTED",
+            message: {
+                role: "ROLE_AGENT",
+                messageId: uuid(),
+                parts: [{ text: error.description default "No autorizado" }]
+            }
+        }
+    }
+}]]]></a2a:status-content>
+				</a2a:update-task-status>
+			</on-error-continue>
+			<on-error-continue type="ANY" logException="true">
+				<flow-ref doc:name="poc-log-error" name="poc-log-error" />
+				<a2a:update-task-status doc:name="Estado FAILED" config-ref="aena-agente-a2a-server">
+					<a2a:status-content><![CDATA[#[%dw 2.0
+output application/json
+---
+{
+    statusUpdate: {
+        taskId: vars.a2aCtx.taskId,
+        contextId: vars.a2aCtx.contextId,
+        status: {
+            state: "TASK_STATE_FAILED",
+            message: {
+                role: "ROLE_AGENT",
+                messageId: uuid(),
+                parts: [{ text: "AENA no ha podido atender la solicitud: " ++ (error.description default "error desconocido") ++ " (correlationId: " ++ (vars.correlationId default "") ++ ")" }]
+            }
+        }
+    }
+}]]]></a2a:status-content>
+				</a2a:update-task-status>
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Seguridad: autoriza el resto de operaciones A2A (GetTask, ListTasks, CancelTask, ...)
+	     con la misma API key que SendMessage. Un error en este flujo = A2A UNAUTHORIZED. -->
+	<!-- ============================================================================================ -->
+	<flow name="aena-agente-autorizar-operaciones">
+		<a2a:task-authorizer-listener doc:name="A2A Task Authorizer" config-ref="aena-agente-a2a-server" />
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aena-agente', dominio: 'AENA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.headers]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<flow-ref doc:name="poc-validar-api-key" name="poc-validar-api-key" />
+		<choice doc:name="¿Autorizado?">
+			<when expression="#[vars.autorizacion.valido]">
+				<logger doc:name="Autorizado" level="TRACE" message="Operación A2A autorizada" />
+			</when>
+			<when expression="#[((attributes.operationName default '') as String) == 'ListTasks']">
+				<set-payload doc:name="Ninguna tarea visible" value="#[output application/json --- []]" />
+			</when>
+			<otherwise>
+				<raise-error doc:name="No autorizado" type="POC:NO_AUTORIZADO" description="#['No autorizado: ' ++ vars.autorizacion.motivo]" />
+			</otherwise>
+		</choice>
+		<error-handler>
+			<on-error-propagate type="POC:NO_AUTORIZADO" logException="false" />
+		</error-handler>
+	</flow>
+
+</mule>

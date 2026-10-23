@@ -1,0 +1,143 @@
+### =====================================================================
+### Pruebas manuales de la POC aerolínea-AENA (extensión REST Client de VS Code)
+### Las tools MCP se prueban con mcp_client.py o desde GitHub Copilot.
+###
+### Seguridad: cada componente exige la API key de la POC en la cabecera X-API-Key.
+### La API key se lee de pruebas/.env (copia .env.example y rellénalo; .env NO se versiona).
+### Ajusta las fechas: deben ser futuras.
+### =====================================================================
+
+@apiKey = {{$dotenv API_KEY}}
+@base = http://localhost:8081
+
+### 1. API de vuelos AENA: búsqueda (acepta código IATA o ciudad)
+POST {{base}}/aena/api/b2b-flights/v1/vuelos/busqueda
+Content-Type: application/json
+X-API-Key: {{apiKey}}
+x-correlation-id: prueba-vuelos-001
+
+{
+  "origen": "Madrid",
+  "destino": "LHR",
+  "fecha": "2026-11-20",
+  "pasajeros": 2
+}
+
+### 2. API de vuelos AENA: detalle de un vuelo (copia un vueloId de la respuesta anterior)
+GET {{base}}/aena/api/b2b-flights/v1/vuelos/DA1234_MADLHR_20261120?pasajeros=2
+X-API-Key: {{apiKey}}
+
+### 3. API de vuelos SIN API key -> 401
+POST {{base}}/aena/api/b2b-flights/v1/vuelos/busqueda
+Content-Type: application/json
+
+{ "origen": "MAD", "destino": "LHR", "fecha": "2026-11-20" }
+
+### 4. API de parking AENA: disponibilidad
+POST {{base}}/aena/api/b2b-parking/v1/disponibilidad
+Content-Type: application/json
+X-API-Key: {{apiKey}}
+
+{
+  "aeropuerto": "MAD",
+  "fechaEntrada": "2026-11-20T06:00",
+  "fechaSalida": "2026-11-27T20:00"
+}
+
+### 5. API de pagos AENA: crear pago (devuelve urlPago: ábrela en el navegador)
+POST {{base}}/aena/api/b2b-payments/v1/pagos
+Content-Type: application/json
+X-API-Key: {{apiKey}}
+
+{
+  "referencia": "PRUEBA1",
+  "importe": 289.98,
+  "concepto": "Prueba de pago"
+}
+
+### 6. Agent Cards (públicas: anuncian que hace falta la API key)
+GET {{base}}/aena/agente/.well-known/agent-card.json
+
+###
+GET {{base}}/aerolinea/agente/.well-known/agent-card.json
+
+### 7. A2A SendMessage (JSON-RPC) al agente de AENA. A2A v1 exige la cabecera A2A-Version.
+POST {{base}}/aena/agente/rpc
+Content-Type: application/json
+A2A-Version: 1.0
+X-API-Key: {{apiKey}}
+x-correlation-id: prueba-a2a-aena-001
+
+{
+  "jsonrpc": "2.0",
+  "id": "req-1",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "msg-001",
+      "role": "ROLE_USER",
+      "parts": [
+        { "data": { "accion": "buscar_vuelos", "argumentos": { "origen": "MAD", "destino": "BCN", "fecha": "2026-11-20", "pasajeros": 1 } }, "mediaType": "application/json" }
+      ]
+    }
+  }
+}
+
+### 8. A2A SendMessage al agente de AENA solo con texto libre (el LLM decide la tool)
+POST {{base}}/aena/agente/rpc
+Content-Type: application/json
+A2A-Version: 1.0
+X-API-Key: {{apiKey}}
+
+{
+  "jsonrpc": "2.0",
+  "id": "req-2",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "msg-002",
+      "role": "ROLE_USER",
+      "parts": [ { "text": "¿Qué opciones de parking hay en Barajas del 20 al 27 de noviembre de 2026?" } ]
+    }
+  }
+}
+
+### 9. A2A SendMessage al agente de la aerolínea (lo mismo que hace el adaptador MCP de Copilot)
+POST {{base}}/aerolinea/agente/rpc
+Content-Type: application/json
+A2A-Version: 1.0
+X-API-Key: {{apiKey}}
+x-correlation-id: prueba-a2a-aerolinea-001
+
+{
+  "jsonrpc": "2.0",
+  "id": "req-3",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "msg-003",
+      "role": "ROLE_USER",
+      "parts": [
+        { "data": { "accion": "buscar_vuelos", "datos": { "origen": "Madrid", "destino": "Londres", "fecha": "2026-11-20", "pasajeros": 1 } }, "mediaType": "application/json" }
+      ]
+    }
+  }
+}
+
+### 10. A2A SendMessage SIN API key -> Task REJECTED ("No autorizado")
+POST {{base}}/aerolinea/agente/rpc
+Content-Type: application/json
+A2A-Version: 1.0
+
+{
+  "jsonrpc": "2.0",
+  "id": "req-4",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "msg-004",
+      "role": "ROLE_USER",
+      "parts": [ { "data": { "accion": "consultar_reserva", "datos": { "localizador": "ABC123" } }, "mediaType": "application/json" } ]
+    }
+  }
+}

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  global.xml
+  Elementos globales compartidos por todos los segmentos de la app:
+    - Configuración: global común (config/poc-global.yaml) + la de cada dominio (config/aerolinea.yaml, config/aena.yaml).
+    - Un único HTTP listener (puerto poc.http.puerto). Cada segmento cuelga de su ruta (/aerolinea/..., /aena/...).
+
+  Segmentos (un XML cada uno):
+    AEROLÍNEA aerolinea-adaptador-mcp.xml   ADAPTADOR MCP: servidor MCP para GitHub Copilot -> A2A al agente de la aerolínea
+              aerolinea-agente.xml          agente A2A de la aerolínea (LLM + MCP reservas, A2A a AENA)
+              aerolinea-mcp-reservas.xml    servidor MCP de reservas (crear, consultar, actualizar)
+              aerolinea-reservas-api.xml    API REST (mock) de reservas, con Object Store
+    AENA      aena-agente.xml               agente A2A de AENA (LLM + MCP vuelos, parking y pagos)
+              aena-mcp-vuelos.xml           MCP bridge de la API de vuelos
+              aena-mcp-parking.xml          MCP bridge de la API de parking
+              aena-mcp-pagos.xml            MCP bridge de la API de pagos
+              aena-vuelos-api.xml           API (mock) de vuelos
+              aena-parking-api.xml          API (mock) de parking, con Object Store
+              aena-pagos-api.xml            API (mock) de pagos tipo Sipay + página de pago
+  Piezas comunes (trazabilidad, logging, seguridad y errores): comun.xml
+
+  Los segmentos se comunican SOLO por protocolo (A2A, MCP o HTTP), nunca con flow-ref entre ellos,
+  para que cualquiera pueda separarse en otra app sin cambiar su lógica.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+	<configuration-properties doc:name="Configuración global POC" file="config/poc-global.yaml" />
+	<configuration-properties doc:name="Configuración AEROLÍNEA" file="config/aerolinea.yaml" />
+	<configuration-properties doc:name="Configuración AENA" file="config/aena.yaml" />
+
+	<http:listener-config name="poc-http-listener" doc:name="HTTP Listener POC">
+		<http:listener-connection host="0.0.0.0" port="${poc.http.puerto}" />
+	</http:listener-config>
+
+</mule>

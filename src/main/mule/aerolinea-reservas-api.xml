@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SEGMENTO AEROLÍNEA - aerolinea-reservas-api.xml
+  API de reservas de la aerolínea (micro clientes): POST /reservas, GET /reservas/{localizador}, PATCH /reservas/{localizador}. Consumidor: aerolinea-mcp-reservas.xml.
+  Ya NO tiene lógica ni datos: es una pasarela (proxy) que valida la API key y llama al micro FastAPI + PostgreSQL
+  (micro-reservas -> ${poc.micros.protocolo}://${poc.micros.reservas.host}). Los errores de negocio del micro (HTTP 400/404) se devuelven tal cual.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+	<http:request-config name="aerolinea-api-reservas-micro-config" doc:name="Cliente HTTP micro-reservas">
+		<http:request-connection protocol="${poc.micros.protocolo}" host="${poc.micros.reservas.host}" port="${poc.micros.reservas.puerto}" />
+	</http:request-config>
+
+	<flow name="aerolinea-api-reservas-crear">
+		<http:listener doc:name="POST /reservas" config-ref="poc-http-listener" path="${poc.rutas.aerolinea.apiReservas}/reservas" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+			<http:error-response statusCode="#[vars.httpStatus default 500]">
+				<http:body><![CDATA[#[output application/json --- {tipo: 'error', codigo: 'ERROR_INTERNO', mensaje: error.description default 'Error interno'}]]]></http:body>
+			</http:error-response>
+		</http:listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-reservas-api', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.headers]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="api-crear-reserva" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'POST /reservas -> micro', datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<try doc:name="Llamar al micro">
+			<http:request doc:name="POST /reservas (micro)" method="POST" config-ref="aerolinea-api-reservas-micro-config" path="/reservas" responseTimeout="${poc.timeouts.httpMs}">
+				<http:body><![CDATA[#[payload]]]></http:body>
+				<http:headers><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></http:headers>
+			</http:request>
+			<set-variable doc:name="HTTP status" variableName="httpStatus" value="#[attributes.statusCode]" />
+			<error-handler>
+				<on-error-continue type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND" logException="false">
+					<set-variable doc:name="HTTP status de negocio" variableName="httpStatus" value="#[error.errorMessage.attributes.statusCode]" />
+					<set-payload doc:name="Error de negocio" value="#[error.errorMessage.payload]" />
+				</on-error-continue>
+				<on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">
+					<set-variable doc:name="HTTP 503" variableName="httpStatus" value="#[503]" />
+					<set-payload doc:name="Micro no disponible" value="#[output application/json --- {tipo: 'error', codigo: 'MICRO_NO_DISPONIBLE', mensaje: 'El micro micro-reservas no responde. ¿Está arrancado Docker (docker compose up -d)?'}]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<set-variable doc:name="Log FIN" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'FIN', mensaje: 'Respuesta del micro: HTTP ' ++ (vars.httpStatus as String), datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<error-handler ref="poc-api-error-handler" />
+	</flow>
+
+	<flow name="aerolinea-api-reservas-consultar">
+		<http:listener doc:name="GET /reservas/{localizador}" config-ref="poc-http-listener" path="${poc.rutas.aerolinea.apiReservas}/reservas/{localizador}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+			<http:error-response statusCode="#[vars.httpStatus default 500]">
+				<http:body><![CDATA[#[output application/json --- {tipo: 'error', codigo: 'ERROR_INTERNO', mensaje: error.description default 'Error interno'}]]]></http:body>
+			</http:error-response>
+		</http:listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-reservas-api', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.headers]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="api-consultar-reserva" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'GET /reservas/{localizador} -> micro', datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<try doc:name="Llamar al micro">
+			<http:request doc:name="GET /reservas/{localizador} (micro)" method="GET" config-ref="aerolinea-api-reservas-micro-config" path="/reservas/{localizador}" responseTimeout="${poc.timeouts.httpMs}">
+				<http:headers><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></http:headers>
+				<http:uri-params><![CDATA[#[output application/java --- {localizador: attributes.uriParams.localizador as String}]]]></http:uri-params>
+			</http:request>
+			<set-variable doc:name="HTTP status" variableName="httpStatus" value="#[attributes.statusCode]" />
+			<error-handler>
+				<on-error-continue type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND" logException="false">
+					<set-variable doc:name="HTTP status de negocio" variableName="httpStatus" value="#[error.errorMessage.attributes.statusCode]" />
+					<set-payload doc:name="Error de negocio" value="#[error.errorMessage.payload]" />
+				</on-error-continue>
+				<on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">
+					<set-variable doc:name="HTTP 503" variableName="httpStatus" value="#[503]" />
+					<set-payload doc:name="Micro no disponible" value="#[output application/json --- {tipo: 'error', codigo: 'MICRO_NO_DISPONIBLE', mensaje: 'El micro micro-reservas no responde. ¿Está arrancado Docker (docker compose up -d)?'}]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<set-variable doc:name="Log FIN" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'FIN', mensaje: 'Respuesta del micro: HTTP ' ++ (vars.httpStatus as String), datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<error-handler ref="poc-api-error-handler" />
+	</flow>
+
+	<flow name="aerolinea-api-reservas-actualizar">
+		<http:listener doc:name="PATCH /reservas/{localizador}" config-ref="poc-http-listener" path="${poc.rutas.aerolinea.apiReservas}/reservas/{localizador}" allowedMethods="PATCH">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+			<http:error-response statusCode="#[vars.httpStatus default 500]">
+				<http:body><![CDATA[#[output application/json --- {tipo: 'error', codigo: 'ERROR_INTERNO', mensaje: error.description default 'Error interno'}]]]></http:body>
+			</http:error-response>
+		</http:listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-reservas-api', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.headers]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="api-actualizar-reserva" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'PATCH /reservas/{localizador} -> micro', datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<try doc:name="Llamar al micro">
+			<http:request doc:name="PATCH /reservas/{localizador} (micro)" method="PATCH" config-ref="aerolinea-api-reservas-micro-config" path="/reservas/{localizador}" responseTimeout="${poc.timeouts.httpMs}">
+				<http:body><![CDATA[#[payload]]]></http:body>
+				<http:headers><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></http:headers>
+				<http:uri-params><![CDATA[#[output application/java --- {localizador: attributes.uriParams.localizador as String}]]]></http:uri-params>
+			</http:request>
+			<set-variable doc:name="HTTP status" variableName="httpStatus" value="#[attributes.statusCode]" />
+			<error-handler>
+				<on-error-continue type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND" logException="false">
+					<set-variable doc:name="HTTP status de negocio" variableName="httpStatus" value="#[error.errorMessage.attributes.statusCode]" />
+					<set-payload doc:name="Error de negocio" value="#[error.errorMessage.payload]" />
+				</on-error-continue>
+				<on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">
+					<set-variable doc:name="HTTP 503" variableName="httpStatus" value="#[503]" />
+					<set-payload doc:name="Micro no disponible" value="#[output application/json --- {tipo: 'error', codigo: 'MICRO_NO_DISPONIBLE', mensaje: 'El micro micro-reservas no responde. ¿Está arrancado Docker (docker compose up -d)?'}]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<set-variable doc:name="Log FIN" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'FIN', mensaje: 'Respuesta del micro: HTTP ' ++ (vars.httpStatus as String), datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<error-handler ref="poc-api-error-handler" />
+	</flow>
+
+</mule>

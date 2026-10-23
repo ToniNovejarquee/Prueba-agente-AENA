@@ -1,0 +1,101 @@
+# =====================================================================================
+#  CONFIGURACIÓN GLOBAL DE LA POC AEROLÍNEA - AENA
+#  Común a todos los segmentos de la app (src/main/mule/*.xml). La carga global.xml.
+#
+#  Solo contiene aspectos TRANSVERSALES (entorno, HTTP, rutas, timeouts, trazabilidad,
+#  logging y LLM). Los parámetros de negocio están en config/aerolinea.yaml y config/aena.yaml.
+#
+#  Cualquier valor se puede sobrescribir sin recompilar con una propiedad de sistema
+#  o de despliegue, p. ej.:  -Dpoc.logging.nivel=INFO
+# =====================================================================================
+poc:
+  entorno: "local"
+
+  http:
+    # Único puerto de la app (en CloudHub 2.0 debe ser 8081)
+    puerto: "8081"
+  # Host con el que los segmentos se llaman entre sí (A2A / MCP / HTTP); dentro de la misma app es loopback
+  host: "localhost"
+  # URL pública de la app: la que se anuncia en las Agent Cards y en el enlace de la página de pago
+  urlPublica: "http://localhost:8081"
+
+  # Ruta de cada segmento sobre el único listener HTTP
+  rutas:
+    aerolinea:
+      mcpCopilot: "/aerolinea/mcp"              # ADAPTADOR MCP: servidor MCP que consume GitHub Copilot
+      agente: "/aerolinea/agente"               # agente A2A de la aerolínea (Agent Card en /.well-known/agent-card.json)
+      mcpReservas: "/aerolinea/mcp-reservas"    # servidor MCP de reservas de la aerolínea
+      apiReservas: "/aerolinea/api/v1"          # API REST (mock) de reservas de la aerolínea
+    aena:
+      agente: "/aena/agente"                    # agente A2A de AENA
+      mcpVuelos: "/aena/mcp-vuelos"             # MCP bridge de la API de vuelos
+      mcpParking: "/aena/mcp-parking"           # MCP bridge de la API de parking
+      mcpPagos: "/aena/mcp-pagos"               # MCP bridge de la API de pagos
+      apiVuelos: "/aena/api/b2b-flights/v1"     # API (mock) de vuelos
+      apiParking: "/aena/api/b2b-parking/v1"    # API (mock) de parking
+      apiPagos: "/aena/api/b2b-payments/v1"     # API (mock) de pagos (pasarela tipo Sipay)
+      paginaPago: "/aena/sipay/pago"            # página web de pago (mock Sipay) que abre el usuario
+
+  # Micros FastAPI + PostgreSQL. Local: docker compose (/docker). En CloudHub se sobrescriben con propiedades de Runtime Manager
+  # (protocolo=HTTPS, host=<servicio>.onrender.com, puerto=443).
+  micros:
+    protocolo: "HTTP"
+    vuelos:
+      host: "localhost"
+      puerto: "8201"
+    parking:
+      host: "localhost"
+      puerto: "8202"
+    pagos:
+      host: "localhost"
+      puerto: "8203"
+    reservas:
+      host: "localhost"
+      puerto: "8101"
+
+  trazabilidad:
+    # Cabecera con la que se propaga el identificador de correlación entre segmentos
+    cabeceraCorrelacion: "x-correlation-id"
+
+  # Seguridad: todos los componentes exigen la API key de la POC en la cabecera X-API-Key
+  # (salvo las Agent Cards y la página de pago, que abre el navegador del usuario).
+  # El VALOR de la API key NO va en este fichero ni en el repo: lo pone su propietario como propiedad de sistema
+  # (-Dpoc.seguridad.apiKey=... en Studio) o como propiedad protegida de Runtime Manager (CloudHub 2.0).
+  # Es obligatoria: sin ella la app no arranca.
+  seguridad:
+    cabecera: "x-api-key"
+
+  logging:
+    # Umbral de los eventos de log estructurado: DEBUG | INFO | WARN | ERROR
+    nivel: "DEBUG"
+    # Incluir payloads/datos en los eventos de log
+    incluirDatos: "true"
+    # Enmascarar datos personales (activar en entornos con datos reales)
+    enmascararDatos: "false"
+    camposSensibles: "nombre,apellidos,email,matricula"
+    # Los datos más largos se truncan en el log
+    maxCaracteresDatos: "6000"
+
+  # Jerarquía de timeouts: cada salto exterior debe esperar más que la suma de los interiores.
+  #   Copilot -> adaptador MCP -> [A2A] agente aerolínea -> [A2A] agente AENA -> [LLM + MCP] -> APIs [HTTP]
+  #   El caso más largo (reservar_vuelo) hace: A2A a AENA + LLM de la aerolínea + 2 llamadas MCP de reservas.
+  timeouts:
+    httpMs: "15000"               # servidor MCP -> API mock
+    mcpSegundos: "30"             # cliente MCP -> servidor MCP (incluye la llamada HTTP a la API)
+    llmSegundos: "45"             # una llamada al LLM (Ollama)
+    a2aAenaSegundos: "130"        # agente aerolínea -> agente AENA: >= llmSegundos x (1 + reintentos) + mcpSegundos (fallback) + margen
+    a2aAerolineaSegundos: "290"   # adaptador -> agente aerolínea: >= a2aAenaSegundos + llmSegundos x (1 + reintentos) + 2 x mcpSegundos + margen
+    copilotSegundos: "300"        # servidor MCP para Copilot: >= a2aAerolineaSegundos + margen
+
+  llm:
+    proveedor: "ollama"
+    # API de Ollama Cloud (no necesita Ollama instalado). El conector Inference envía "Authorization: Bearer <apiKey>".
+    url: "https://ollama.com/api"
+    # En la API de ollama.com el modelo va SIN el sufijo "-cloud" (ese sufijo solo existe en el daemon local)
+    modelo: "gpt-oss:120b"
+    # poc.llm.apiKey: API key de ollama.com. Es un SECRETO: NO va en este fichero ni en el repo.
+    #   Local: -Dpoc.llm.apiKey=... en los argumentos de la VM de Studio. CloudHub 2.0: propiedad protegida.
+    #   Es obligatoria: sin ella la app no arranca.
+    # Para volver a Ollama local: -Dpoc.llm.url=http://localhost:11434/api -Dpoc.llm.modelo=gpt-oss:120b-cloud -Dpoc.llm.apiKey=local
+    temperatura: "0.1"
+    maxTokens: "4096"

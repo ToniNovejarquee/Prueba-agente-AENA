@@ -1,0 +1,19 @@
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "poc-api-key",
+      "description": "API key de la POC aerolínea-AENA (valor de poc.seguridad.apiKey)",
+      "password": true
+    }
+  ],
+  "servers": {
+    "aerolinea-demo-viajes": {
+      "type": "http",
+      "url": "http://localhost:8081/aerolinea/mcp",
+      "headers": {
+        "X-API-Key": "${input:poc-api-key}"
+      }
+    }
+  }
+}

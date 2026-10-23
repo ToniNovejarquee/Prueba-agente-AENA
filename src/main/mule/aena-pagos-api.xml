@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SEGMENTO AENA - aena-pagos-api.xml
+  API de pagos (b2b-payments, pasarela simulada tipo Sipay): POST /pagos y GET /pagos/{idPago}. Consumidor: aena-mcp-pagos.xml.
+  La página de pago que abre el usuario la sirve directamente el micro-pagos (urlPago = http://localhost:8203/pago/{idPago}).
+  Ya NO tiene lógica ni datos: es una pasarela (proxy) que valida la API key y llama al micro FastAPI + PostgreSQL
+  (micro-pagos -> ${poc.micros.protocolo}://${poc.micros.pagos.host}). Los errores de negocio del micro (HTTP 400/404) se devuelven tal cual.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+	<http:request-config name="aena-api-pagos-micro-config" doc:name="Cliente HTTP micro-pagos">
+		<http:request-connection protocol="${poc.micros.protocolo}" host="${poc.micros.pagos.host}" port="${poc.micros.pagos.puerto}" />
+	</http:request-config>
+
+	<flow name="aena-api-pagos-crear">
+		<http:listener doc:name="POST /pagos" config-ref="poc-http-listener" path="${poc.rutas.aena.apiPagos}/pagos" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+			<http:error-response statusCode="#[vars.httpStatus default 500]">
+				<http:body><![CDATA[#[output application/json --- {tipo: 'error', codigo: 'ERROR_INTERNO', mensaje: error.description default 'Error interno'}]]]></http:body>
+			</http:error-response>
+		</http:listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aena-pagos-api', dominio: 'AENA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.headers]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="api-crear-pago" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'POST /pagos -> micro', datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<try doc:name="Llamar al micro">
+			<http:request doc:name="POST /pagos (micro)" method="POST" config-ref="aena-api-pagos-micro-config" path="/pagos" responseTimeout="${poc.timeouts.httpMs}">
+				<http:body><![CDATA[#[payload]]]></http:body>
+				<http:headers><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></http:headers>
+			</http:request>
+			<set-variable doc:name="HTTP status" variableName="httpStatus" value="#[attributes.statusCode]" />
+			<error-handler>
+				<on-error-continue type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND" logException="false">
+					<set-variable doc:name="HTTP status de negocio" variableName="httpStatus" value="#[error.errorMessage.attributes.statusCode]" />
+					<set-payload doc:name="Error de negocio" value="#[error.errorMessage.payload]" />
+				</on-error-continue>
+				<on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">
+					<set-variable doc:name="HTTP 503" variableName="httpStatus" value="#[503]" />
+					<set-payload doc:name="Micro no disponible" value="#[output application/json --- {tipo: 'error', codigo: 'MICRO_NO_DISPONIBLE', mensaje: 'El micro micro-pagos no responde. ¿Está arrancado Docker (docker compose up -d)?'}]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<set-variable doc:name="Log FIN" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'FIN', mensaje: 'Respuesta del micro: HTTP ' ++ (vars.httpStatus as String), datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<error-handler ref="poc-api-error-handler" />
+	</flow>
+
+	<flow name="aena-api-pagos-consultar">
+		<http:listener doc:name="GET /pagos/{idPago}" config-ref="poc-http-listener" path="${poc.rutas.aena.apiPagos}/pagos/{idPago}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+			<http:error-response statusCode="#[vars.httpStatus default 500]">
+				<http:body><![CDATA[#[output application/json --- {tipo: 'error', codigo: 'ERROR_INTERNO', mensaje: error.description default 'Error interno'}]]]></http:body>
+			</http:error-response>
+		</http:listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aena-pagos-api', dominio: 'AENA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.headers]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="api-consultar-pago" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'GET /pagos/{idPago} -> micro', datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<try doc:name="Llamar al micro">
+			<http:request doc:name="GET /pagos/{idPago} (micro)" method="GET" config-ref="aena-api-pagos-micro-config" path="/pagos/{idPago}" responseTimeout="${poc.timeouts.httpMs}">
+				<http:headers><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></http:headers>
+				<http:uri-params><![CDATA[#[output application/java --- {idPago: attributes.uriParams.idPago as String}]]]></http:uri-params>
+			</http:request>
+			<set-variable doc:name="HTTP status" variableName="httpStatus" value="#[attributes.statusCode]" />
+			<error-handler>
+				<on-error-continue type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND" logException="false">
+					<set-variable doc:name="HTTP status de negocio" variableName="httpStatus" value="#[error.errorMessage.attributes.statusCode]" />
+					<set-payload doc:name="Error de negocio" value="#[error.errorMessage.payload]" />
+				</on-error-continue>
+				<on-error-continue type="HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">
+					<set-variable doc:name="HTTP 503" variableName="httpStatus" value="#[503]" />
+					<set-payload doc:name="Micro no disponible" value="#[output application/json --- {tipo: 'error', codigo: 'MICRO_NO_DISPONIBLE', mensaje: 'El micro micro-pagos no responde. ¿Está arrancado Docker (docker compose up -d)?'}]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<set-variable doc:name="Log FIN" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'FIN', mensaje: 'Respuesta del micro: HTTP ' ++ (vars.httpStatus as String), datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<error-handler ref="poc-api-error-handler" />
+	</flow>
+
+</mule>

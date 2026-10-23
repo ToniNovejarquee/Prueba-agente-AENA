@@ -1,0 +1,36 @@
+# =====================================================================================
+#  CONFIGURACIÓN DEL DOMINIO AENA (agente, MCP vuelos/parking/pagos y APIs mock)
+# =====================================================================================
+aena:
+
+  agente:
+    nombre: "Agente AENA"
+    version: "1.0.0"
+    organizacion: "AENA"
+    # true: el LLM decide qué tool MCP invocar (con salvaguarda determinista si falla).
+    # false: la tool se llama directamente (demo más rápida, sin depender del LLM).
+    usarLlm: "true"
+    reintentosLlm: "0"
+    fallbackDeterminista: "true"
+
+  vuelos:
+    # Compañía que opera los vuelos del mock (debe coincidir con aerolinea.negocio.codigoCompania)
+    compania: "DA"
+    nombreCompania: "Aerolinea Demo"
+    # Tarifa del mock: precio por pasajero = base + km x precioKm (redondeado), con variación por horario
+    precioBase: "39"
+    precioKm: "0.085"
+    plazasMaximas: "9"
+
+  parking:
+    # Precio por día (o fracción) de cada producto de parking del mock
+    precioDiaGeneral: "18.50"
+    precioDiaExpress: "29.90"
+    precioDiaLargaEstancia: "9.95"
+    # Larga estancia: mínimo de días
+    minDiasLargaEstancia: "4"
+
+  pagos:
+    moneda: "EUR"
+    # Nombre comercial de la pasarela que muestra la página de pago (mock)
+    pasarela: "Sipay (simulada)"

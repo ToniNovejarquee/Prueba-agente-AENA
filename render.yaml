@@ -1,0 +1,51 @@
+# Render Blueprint: 4 micros FastAPI + 1 PostgreSQL. En Render: New + > Blueprint > elige este repo.
+databases:
+  - name: poc-db
+    plan: free
+    databaseName: poc
+
+services:
+  - type: web
+    name: poc-micro-vuelos
+    runtime: docker
+    dockerfilePath: ./docker/micros/Dockerfile
+    dockerContext: ./docker/micros
+    dockerCommand: uvicorn vuelos.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: { name: poc-db, property: connectionString }
+  - type: web
+    name: poc-micro-parking
+    runtime: docker
+    dockerfilePath: ./docker/micros/Dockerfile
+    dockerContext: ./docker/micros
+    dockerCommand: uvicorn parking.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: { name: poc-db, property: connectionString }
+  - type: web
+    name: poc-micro-pagos
+    runtime: docker
+    dockerfilePath: ./docker/micros/Dockerfile
+    dockerContext: ./docker/micros
+    dockerCommand: uvicorn pagos.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: { name: poc-db, property: connectionString }
+  - type: web
+    name: poc-micro-reservas
+    runtime: docker
+    dockerfilePath: ./docker/micros/Dockerfile
+    dockerContext: ./docker/micros
+    dockerCommand: uvicorn reservas.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: { name: poc-db, property: connectionString }

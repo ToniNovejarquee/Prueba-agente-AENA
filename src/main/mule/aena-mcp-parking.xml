@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SEGMENTO AENA - aena-mcp-parking  (ruta ${poc.rutas.aena.mcpParking})  ("MCP parking · MCP Bridge" del diagrama)
+  Servidor MCP (Streamable HTTP) que recubre la API de parking (aena-parking-api.xml):
+    buscar_parking    -> POST /disponibilidad
+    reservar_parking  -> POST /reservas
+  Consumidor: el agente de AENA (aena-agente.xml), cuyo LLM decide la tool.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd">
+
+	<http:request-config name="aena-mcp-parking-api-request-config" doc:name="Cliente HTTP API parking AENA">
+		<http:request-connection host="${poc.host}" port="${poc.http.puerto}" />
+		<http:default-headers>
+			<http:default-header key="X-API-Key" value="${poc.seguridad.apiKey}" />
+		</http:default-headers>
+	</http:request-config>
+
+	<mcp:server-config name="aena-mcp-parking-server" doc:name="MCP Server aena-mcp-parking" serverName="aena-mcp-parking" serverVersion="1.0.0">
+		<mcp:streamable-http-server-connection listenerConfig="poc-http-listener" mcpEndpointPath="${poc.rutas.aena.mcpParking}" requestTimeout="${poc.timeouts.mcpSegundos}" />
+	</mcp:server-config>
+
+	<!-- ============================================================================================ -->
+	<!-- Seguridad: solo se abre sesión MCP con la API key de la POC.
+	     Sin API key válida se rechaza con 401 antes de que el cliente pueda listar o invocar tools. -->
+	<!-- ============================================================================================ -->
+	<flow name="aena-mcp-parking-nueva-sesion-mcp">
+		<mcp:on-new-session-listener doc:name="Nueva sesión MCP" config-ref="aena-mcp-parking-server">
+			<mcp:rejection rejectWithStatusCode="#[vars.rechazo.status]" rejectWithMessage="#[vars.rechazo.mensaje]" rejectWithHeaders="#[vars.rechazo.cabeceras]" />
+		</mcp:on-new-session-listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aena-mcp-parking', dominio: 'AENA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[payload.additionalProperties]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'sesion-mcp', fase: 'INICIO', mensaje: 'Solicitud de nueva sesión MCP', datos: {sesionMcp: payload.sessionId, cabeceras: payload.additionalProperties}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-validar-api-key" name="poc-validar-api-key" />
+		<set-variable doc:name="Aceptar o rechazar" variableName="rechazo" value="#[output application/java --- if (vars.autorizacion.valido) null else {status: 401, mensaje: 'No autorizado: ' ++ vars.autorizacion.motivo, cabeceras: {'WWW-Authenticate': 'ApiKey'}}]" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool buscar_parking  ->  POST /disponibilidad -->
+	<!-- ============================================================================================ -->
+	<flow name="tool-buscar-parking">
+		<mcp:tool-listener doc:name="Tool buscar_parking" config-ref="aena-mcp-parking-server" name="buscar_parking">
+			<mcp:description><![CDATA[Consulta las opciones de parking de un aeropuerto de AENA (Express, General, Larga Estancia) con su precio para unas fechas de entrada y salida. Devuelve un JSON con tipo "parking_disponibilidad" y las opciones, o tipo "error".]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"aeropuerto": {
+			"type": "string",
+			"description": "Aeropuerto AENA donde se deja el coche: código IATA (3 letras, p. ej. MAD) o nombre de la ciudad/aeropuerto"
+		},
+		"fechaEntrada": {
+			"type": "string",
+			"description": "Entrada al parking: AAAA-MM-DD o AAAA-MM-DDTHH:mm"
+		},
+		"fechaSalida": {
+			"type": "string",
+			"description": "Salida del parking: AAAA-MM-DD o AAAA-MM-DDTHH:mm"
+		},
+		"correlationId": {
+			"type": "string",
+			"description": "Identificador de trazabilidad de la petición. Opcional: si la solicitud trae un correlationId, cópialo tal cual"
+		}
+	},
+	"required": [
+		"aeropuerto",
+		"fechaEntrada",
+		"fechaSalida"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[write(payload, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#[write({tipo: 'error', codigo: 'ERROR_TOOL', mensaje: 'Error en buscar_parking: ' ++ (error.description default 'error desconocido')}, 'application/json')]" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+
+		<!-- Trazabilidad: cabecera x-correlation-id (llamadas directas) o argumento correlationId (llamadas decididas por un LLM) -->
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aena-mcp-parking', dominio: 'AENA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<set-variable doc:name="correlationId en argumentos" variableName="correlationIdEntrante" value="#[payload.correlationId default null]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="tool-buscar_parking" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Invocación de la tool MCP buscar_parking', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+
+		<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'aena-mcp-parking-api', fase: 'LLAMADA_SALIENTE', mensaje: 'POST /disponibilidad', datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<!-- Los errores de negocio (4xx) no son errores técnicos: vuelven como datos {tipo: "error", ...} para el agente -->
+		<try doc:name="Llamada a la API">
+			<http:request doc:name="POST /disponibilidad" method="POST" config-ref="aena-mcp-parking-api-request-config" path="${poc.rutas.aena.apiParking}/disponibilidad" responseTimeout="${poc.timeouts.httpMs}">
+				<http:body><![CDATA[#[output application/json --- payload - 'correlationId']]]></http:body>
+				<http:headers><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></http:headers>
+			</http:request>
+			<error-handler>
+				<on-error-continue type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND" logException="false">
+					<set-payload doc:name="Error de negocio" value="#[error.errorMessage.payload]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'aena-mcp-parking-api', fase: 'RESPUESTA', mensaje: 'Respuesta de la API: ' ++ ((payload.tipo default '') as String), datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool reservar_parking  ->  POST /reservas -->
+	<!-- ============================================================================================ -->
+	<flow name="tool-reservar-parking">
+		<mcp:tool-listener doc:name="Tool reservar_parking" config-ref="aena-mcp-parking-server" name="reservar_parking">
+			<mcp:description><![CDATA[Reserva una plaza de parking de AENA en la opción elegida (opcionId devuelto por buscar_parking). Devuelve un JSON con tipo "parking_reserva" (codigoReserva, importe) o tipo "error".]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"aeropuerto": {
+			"type": "string",
+			"description": "Aeropuerto AENA: código IATA (3 letras, p. ej. MAD) o nombre de la ciudad/aeropuerto"
+		},
+		"opcionId": {
+			"type": "string",
+			"enum": [
+				"EXPRESS",
+				"GENERAL",
+				"LARGA_ESTANCIA"
+			],
+			"description": "Opción de parking elegida"
+		},
+		"fechaEntrada": {
+			"type": "string",
+			"description": "Entrada al parking: AAAA-MM-DD o AAAA-MM-DDTHH:mm"
+		},
+		"fechaSalida": {
+			"type": "string",
+			"description": "Salida del parking: AAAA-MM-DD o AAAA-MM-DDTHH:mm"
+		},
+		"matricula": {
+			"type": "string",
+			"description": "Matrícula del coche (opcional)"
+		},
+		"referencia": {
+			"type": "string",
+			"description": "Referencia externa, normalmente el localizador de la reserva del vuelo"
+		},
+		"correlationId": {
+			"type": "string",
+			"description": "Identificador de trazabilidad de la petición. Opcional: si la solicitud trae un correlationId, cópialo tal cual"
+		}
+	},
+	"required": [
+		"aeropuerto",
+		"opcionId",
+		"fechaEntrada",
+		"fechaSalida"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[write(payload, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#[write({tipo: 'error', codigo: 'ERROR_TOOL', mensaje: 'Error en reservar_parking: ' ++ (error.description default 'error desconocido')}, 'application/json')]" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+
+		<!-- Trazabilidad: cabecera x-correlation-id (llamadas directas) o argumento correlationId (llamadas decididas por un LLM) -->
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aena-mcp-parking', dominio: 'AENA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<set-variable doc:name="correlationId en argumentos" variableName="correlationIdEntrante" value="#[payload.correlationId default null]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="tool-reservar_parking" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Invocación de la tool MCP reservar_parking', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+
+		<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'aena-mcp-parking-api', fase: 'LLAMADA_SALIENTE', mensaje: 'POST /reservas', datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<!-- Los errores de negocio (4xx) no son errores técnicos: vuelven como datos {tipo: "error", ...} para el agente -->
+		<try doc:name="Llamada a la API">
+			<http:request doc:name="POST /reservas" method="POST" config-ref="aena-mcp-parking-api-request-config" path="${poc.rutas.aena.apiParking}/reservas" responseTimeout="${poc.timeouts.httpMs}">
+				<http:body><![CDATA[#[output application/json --- payload - 'correlationId']]]></http:body>
+				<http:headers><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></http:headers>
+			</http:request>
+			<error-handler>
+				<on-error-continue type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND" logException="false">
+					<set-payload doc:name="Error de negocio" value="#[error.errorMessage.payload]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'aena-mcp-parking-api', fase: 'RESPUESTA', mensaje: 'Respuesta de la API: ' ++ ((payload.tipo default '') as String), datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+</mule>

@@ -1,0 +1,273 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SEGMENTO AEROLÍNEA - aerolinea-mcp-reservas  (ruta ${poc.rutas.aerolinea.mcpReservas})  ("MCP reservas" del diagrama)
+  Servidor MCP (Streamable HTTP) que recubre la API de reservas de la aerolínea (aerolinea-reservas-api.xml):
+    crear_reserva       -> POST  /reservas
+    consultar_reserva   -> GET   /reservas/{localizador}
+    actualizar_reserva  -> PATCH /reservas/{localizador}
+  Consumidor: el agente de la aerolínea (aerolinea-agente.xml), cuyo LLM decide la tool.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd">
+
+	<http:request-config name="aerolinea-mcp-reservas-api-request-config" doc:name="Cliente HTTP API reservas aerolínea">
+		<http:request-connection host="${poc.host}" port="${poc.http.puerto}" />
+		<http:default-headers>
+			<http:default-header key="X-API-Key" value="${poc.seguridad.apiKey}" />
+		</http:default-headers>
+	</http:request-config>
+
+	<mcp:server-config name="aerolinea-mcp-reservas-server" doc:name="MCP Server aerolinea-mcp-reservas" serverName="aerolinea-mcp-reservas" serverVersion="1.0.0">
+		<mcp:streamable-http-server-connection listenerConfig="poc-http-listener" mcpEndpointPath="${poc.rutas.aerolinea.mcpReservas}" requestTimeout="${poc.timeouts.mcpSegundos}" />
+	</mcp:server-config>
+
+	<!-- ============================================================================================ -->
+	<!-- Seguridad: solo se abre sesión MCP con la API key de la POC.
+	     Sin API key válida se rechaza con 401 antes de que el cliente pueda listar o invocar tools. -->
+	<!-- ============================================================================================ -->
+	<flow name="aerolinea-mcp-reservas-nueva-sesion-mcp">
+		<mcp:on-new-session-listener doc:name="Nueva sesión MCP" config-ref="aerolinea-mcp-reservas-server">
+			<mcp:rejection rejectWithStatusCode="#[vars.rechazo.status]" rejectWithMessage="#[vars.rechazo.mensaje]" rejectWithHeaders="#[vars.rechazo.cabeceras]" />
+		</mcp:on-new-session-listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-mcp-reservas', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[payload.additionalProperties]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'sesion-mcp', fase: 'INICIO', mensaje: 'Solicitud de nueva sesión MCP', datos: {sesionMcp: payload.sessionId, cabeceras: payload.additionalProperties}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-validar-api-key" name="poc-validar-api-key" />
+		<set-variable doc:name="Aceptar o rechazar" variableName="rechazo" value="#[output application/java --- if (vars.autorizacion.valido) null else {status: 401, mensaje: 'No autorizado: ' ++ vars.autorizacion.motivo, cabeceras: {'WWW-Authenticate': 'ApiKey'}}]" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool crear_reserva  ->  POST /reservas -->
+	<!-- ============================================================================================ -->
+	<flow name="tool-crear-reserva">
+		<mcp:tool-listener doc:name="Tool crear_reserva" config-ref="aerolinea-mcp-reservas-server" name="crear_reserva">
+			<mcp:description><![CDATA[Crea una reserva de vuelo en el sistema de reservas de la aerolínea, en estado PENDIENTE_PAGO. Devuelve un JSON con tipo "reserva" (localizador, estado, importes) o tipo "error".]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"vuelo": {
+			"type": "object",
+			"description": "Vuelo elegido, copiado tal cual de la consulta del vuelo (vueloId, numeroVuelo, origen, destino, salida, llegada, precioPorPasajero, precioTotal...)"
+		},
+		"pasajeros": {
+			"type": "integer",
+			"minimum": 1,
+			"maximum": 9,
+			"description": "Número de pasajeros"
+		},
+		"titular": {
+			"type": "object",
+			"description": "Titular de la reserva",
+			"properties": {
+				"nombre": {
+					"type": "string"
+				},
+				"apellidos": {
+					"type": "string"
+				},
+				"email": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"nombre",
+				"apellidos",
+				"email"
+			]
+		},
+		"correlationId": {
+			"type": "string",
+			"description": "Identificador de trazabilidad de la petición. Opcional: si la solicitud trae un correlationId, cópialo tal cual"
+		}
+	},
+	"required": [
+		"vuelo",
+		"pasajeros",
+		"titular"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[write(payload, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#[write({tipo: 'error', codigo: 'ERROR_TOOL', mensaje: 'Error en crear_reserva: ' ++ (error.description default 'error desconocido')}, 'application/json')]" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+
+		<!-- Trazabilidad: cabecera x-correlation-id (llamadas directas) o argumento correlationId (llamadas decididas por un LLM) -->
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-mcp-reservas', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<set-variable doc:name="correlationId en argumentos" variableName="correlationIdEntrante" value="#[payload.correlationId default null]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="tool-crear_reserva" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Invocación de la tool MCP crear_reserva', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+
+		<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'aerolinea-mcp-reservas-api', fase: 'LLAMADA_SALIENTE', mensaje: 'POST /reservas', datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<!-- Los errores de negocio (4xx) no son errores técnicos: vuelven como datos {tipo: "error", ...} para el agente -->
+		<try doc:name="Llamada a la API">
+			<http:request doc:name="POST /reservas" method="POST" config-ref="aerolinea-mcp-reservas-api-request-config" path="${poc.rutas.aerolinea.apiReservas}/reservas" responseTimeout="${poc.timeouts.httpMs}">
+				<http:body><![CDATA[#[output application/json --- payload - 'correlationId']]]></http:body>
+				<http:headers><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></http:headers>
+			</http:request>
+			<error-handler>
+				<on-error-continue type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND" logException="false">
+					<set-payload doc:name="Error de negocio" value="#[error.errorMessage.payload]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'aerolinea-mcp-reservas-api', fase: 'RESPUESTA', mensaje: 'Respuesta de la API: ' ++ ((payload.tipo default '') as String), datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool consultar_reserva  ->  GET /reservas/{localizador} -->
+	<!-- ============================================================================================ -->
+	<flow name="tool-consultar-reserva">
+		<mcp:tool-listener doc:name="Tool consultar_reserva" config-ref="aerolinea-mcp-reservas-server" name="consultar_reserva">
+			<mcp:description><![CDATA[Devuelve una reserva por su localizador. Devuelve un JSON con tipo "reserva" o tipo "error".]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"localizador": {
+			"type": "string",
+			"description": "Localizador de la reserva (6 caracteres)"
+		},
+		"correlationId": {
+			"type": "string",
+			"description": "Identificador de trazabilidad de la petición. Opcional: si la solicitud trae un correlationId, cópialo tal cual"
+		}
+	},
+	"required": [
+		"localizador"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[write(payload, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#[write({tipo: 'error', codigo: 'ERROR_TOOL', mensaje: 'Error en consultar_reserva: ' ++ (error.description default 'error desconocido')}, 'application/json')]" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+
+		<!-- Trazabilidad: cabecera x-correlation-id (llamadas directas) o argumento correlationId (llamadas decididas por un LLM) -->
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-mcp-reservas', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<set-variable doc:name="correlationId en argumentos" variableName="correlationIdEntrante" value="#[payload.correlationId default null]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="tool-consultar_reserva" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Invocación de la tool MCP consultar_reserva', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+
+		<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'aerolinea-mcp-reservas-api', fase: 'LLAMADA_SALIENTE', mensaje: 'GET /reservas/{localizador}', datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<!-- Los errores de negocio (4xx) no son errores técnicos: vuelven como datos {tipo: "error", ...} para el agente -->
+		<try doc:name="Llamada a la API">
+			<http:request doc:name="GET /reservas/{localizador}" method="GET" config-ref="aerolinea-mcp-reservas-api-request-config" path="${poc.rutas.aerolinea.apiReservas}/reservas/{localizador}" responseTimeout="${poc.timeouts.httpMs}">
+				<http:headers><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></http:headers>
+				<http:uri-params><![CDATA[#[output application/java --- {localizador: payload.localizador as String}]]]></http:uri-params>
+			</http:request>
+			<error-handler>
+				<on-error-continue type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND" logException="false">
+					<set-payload doc:name="Error de negocio" value="#[error.errorMessage.payload]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'aerolinea-mcp-reservas-api', fase: 'RESPUESTA', mensaje: 'Respuesta de la API: ' ++ ((payload.tipo default '') as String), datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool actualizar_reserva  ->  PATCH /reservas/{localizador} -->
+	<!-- ============================================================================================ -->
+	<flow name="tool-actualizar-reserva">
+		<mcp:tool-listener doc:name="Tool actualizar_reserva" config-ref="aerolinea-mcp-reservas-server" name="actualizar_reserva">
+			<mcp:description><![CDATA[Actualiza una reserva: añade el parking de AENA, registra el pago o cambia el estado. Solo se modifican los campos enviados; el total se recalcula solo. Devuelve un JSON con tipo "reserva" o tipo "error".]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"localizador": {
+			"type": "string",
+			"description": "Localizador de la reserva"
+		},
+		"parking": {
+			"type": "object",
+			"description": "Reserva de parking de AENA, copiada tal cual (codigoReserva, producto, fechas, importe...)"
+		},
+		"pago": {
+			"type": "object",
+			"description": "Datos del pago, copiados tal cual (idPago, estado, urlPago, importe...)"
+		},
+		"estado": {
+			"type": "string",
+			"enum": [
+				"PENDIENTE_PAGO",
+				"CONFIRMADA",
+				"CANCELADA"
+			],
+			"description": "Nuevo estado de la reserva"
+		},
+		"correlationId": {
+			"type": "string",
+			"description": "Identificador de trazabilidad de la petición. Opcional: si la solicitud trae un correlationId, cópialo tal cual"
+		}
+	},
+	"required": [
+		"localizador"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[write(payload, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#[write({tipo: 'error', codigo: 'ERROR_TOOL', mensaje: 'Error en actualizar_reserva: ' ++ (error.description default 'error desconocido')}, 'application/json')]" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+
+		<!-- Trazabilidad: cabecera x-correlation-id (llamadas directas) o argumento correlationId (llamadas decididas por un LLM) -->
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-mcp-reservas', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<set-variable doc:name="correlationId en argumentos" variableName="correlationIdEntrante" value="#[payload.correlationId default null]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="tool-actualizar_reserva" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Invocación de la tool MCP actualizar_reserva', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+
+		<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'aerolinea-mcp-reservas-api', fase: 'LLAMADA_SALIENTE', mensaje: 'PATCH /reservas/{localizador}', datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<!-- Los errores de negocio (4xx) no son errores técnicos: vuelven como datos {tipo: "error", ...} para el agente -->
+		<try doc:name="Llamada a la API">
+			<http:request doc:name="PATCH /reservas/{localizador}" method="PATCH" config-ref="aerolinea-mcp-reservas-api-request-config" path="${poc.rutas.aerolinea.apiReservas}/reservas/{localizador}" responseTimeout="${poc.timeouts.httpMs}">
+				<http:body><![CDATA[#[output application/json --- payload - 'correlationId' - 'localizador']]]></http:body>
+				<http:headers><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></http:headers>
+				<http:uri-params><![CDATA[#[output application/java --- {localizador: payload.localizador as String}]]]></http:uri-params>
+			</http:request>
+			<error-handler>
+				<on-error-continue type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND" logException="false">
+					<set-payload doc:name="Error de negocio" value="#[error.errorMessage.payload]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'aerolinea-mcp-reservas-api', fase: 'RESPUESTA', mensaje: 'Respuesta de la API: ' ++ ((payload.tipo default '') as String), datos: payload}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+</mule>

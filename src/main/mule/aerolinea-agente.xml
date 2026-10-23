@@ -1,0 +1,611 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SEGMENTO AEROLÍNEA - aerolinea-agente  (ruta ${poc.rutas.aerolinea.agente})  ("Agente aerolínea · A2A + LLM" del diagrama)
+  Agente de la aerolínea expuesto por A2A. Lo invoca el adaptador MCP (GitHub Copilot) o cualquier canal A2A
+  (p. ej. el chat de la app de la aerolínea). Entrada: DataPart JSON {accion, datos}.
+  Orquestación por acción:
+    buscar_vuelos      -> A2A a AENA (buscar_vuelos)
+    reservar_vuelo     -> A2A a AENA (consultar_vuelo: precio y plazas actualizados) -> MCP reservas crear_reserva (decide el LLM)
+    buscar_parking     -> [MCP reservas consultar_reserva para completar aeropuerto/fecha] -> A2A a AENA (buscar_parking)
+    reservar_parking   -> MCP reservas consultar_reserva -> A2A a AENA (reservar_parking) -> MCP reservas actualizar_reserva (decide el LLM)
+    pagar_reserva      -> MCP reservas consultar_reserva -> A2A a AENA (crear_pago) -> MCP reservas actualizar_reserva (decide el LLM)
+    consultar_reserva  -> MCP reservas consultar_reserva -> [si el pago está pendiente: A2A a AENA (estado_pago) -> actualizar_reserva]
+  El LLM decide las operaciones de ESCRITURA en reservas; las lecturas van directas. Si el LLM falla, se invoca la tool
+  directamente (origen FALLBACK_TOOL_DIRECTA). Con aerolinea.agente.usarLlm=false se invoca siempre directamente.
+  Devuelve un artifact "resultado-aerolinea" con el resultado JSON {tipo, ...} y un resumen legible para el cliente.
+  Agent Card: http://localhost:8081/aerolinea/agente/.well-known/agent-card.json
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+	xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+	xmlns:ms-inference="http://www.mulesoft.org/schema/mule/ms-inference"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd
+http://www.mulesoft.org/schema/mule/ms-inference http://www.mulesoft.org/schema/mule/ms-inference/current/mule-ms-inference.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!-- Servidor A2A + Agent Card -->
+	<a2a:server-config name="aerolinea-agente-a2a-server" doc:name="A2A Server aerolínea">
+		<a2a:connection listenerConfig="poc-http-listener" agentPath="${poc.rutas.aerolinea.agente}">
+			<a2a:interfaces>
+				<a2a:interface protocol="JSONRPC" path="/rpc" />
+				<a2a:interface protocol="HTTP_JSON" path="/" />
+			</a2a:interfaces>
+		</a2a:connection>
+		<a2a:agent-card>
+			<a2a:json><![CDATA[{
+  "name": "${aerolinea.agente.nombre}",
+  "description": "Agente de atención al cliente de la aerolínea: busca y reserva vuelos, añade parking de AENA y gestiona el pago. Gestiona las reservas con su servidor MCP (decide un LLM) y delega en el agente de AENA por A2A los vuelos, el parking y los pagos.",
+  "version": "${aerolinea.agente.version}",
+  "protocolVersion": "1.0",
+  "provider": { "organization": "${aerolinea.agente.organizacion}", "url": "https://www.example.com" },
+  "supportedInterfaces": [
+    { "protocolBinding": "JSONRPC",   "url": "${poc.urlPublica}${poc.rutas.aerolinea.agente}/rpc", "protocolVersion": "1.0", "tenant": "" },
+    { "protocolBinding": "HTTP+JSON", "url": "${poc.urlPublica}${poc.rutas.aerolinea.agente}",     "protocolVersion": "1.0", "tenant": "" }
+  ],
+  "capabilities": { "streaming": false, "pushNotifications": false, "extendedAgentCard": false },
+  "securitySchemes": {
+    "apiKey": { "apiKeySecurityScheme": { "location": "header", "name": "X-API-Key", "description": "API key de la POC (cabecera X-API-Key)" } }
+  },
+  "securityRequirements": [ { "schemes": { "apiKey": { "list": [] } } } ],
+  "skills": [
+    {
+      "id": "reservar-viaje",
+      "name": "Reservar viaje",
+      "description": "Entrada: DataPart JSON {accion, datos}. Acciones: buscar_vuelos {origen, destino, fecha, pasajeros}, reservar_vuelo {vueloId, pasajeros, titular{nombre, apellidos, email}}, buscar_parking {localizador | aeropuerto, fechaEntrada, fechaSalida}, reservar_parking {localizador, opcionId, fechaSalida, fechaEntrada?, matricula?}, pagar_reserva {localizador}, consultar_reserva {localizador}. Salida: artifact 'resultado-aerolinea' con el resultado JSON y un resumen en texto.",
+      "tags": ["vuelos", "viajes", "reservas", "aerolinea", "parking", "pagos"],
+      "examples": [
+        "Busca vuelos de Madrid a Londres el 2026-11-20",
+        "Reserva el vuelo DA1234_MADLHR_20261120 para Ana López",
+        "Añade parking en Barajas a la reserva Q7K2LM y págala"
+      ],
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["application/json", "text/plain"]
+    }
+  ],
+  "defaultInputModes": ["application/json", "text/plain"],
+  "defaultOutputModes": ["application/json", "text/plain"]
+}]]></a2a:json>
+		</a2a:agent-card>
+	</a2a:server-config>
+
+	<!-- Cliente A2A hacia el agente de AENA (descubre la Agent Card en {agentUrl}/.well-known/agent-card.json) -->
+	<a2a:client-config name="aena-agente-a2a-client" doc:name="A2A Client agente AENA">
+		<a2a:jsonrpc-client-connection agentUrl="http://${poc.host}:${poc.http.puerto}${poc.rutas.aena.agente}" requestTimeout="${poc.timeouts.a2aAenaSegundos}">
+			<!-- API key de la POC (en el diagrama: Client ID de la aerolínea en el Omni Gateway de AENA) -->
+			<a2a:default-headers>
+				<a2a:default-header key="X-API-Key" value="${poc.seguridad.apiKey}" />
+			</a2a:default-headers>
+		</a2a:jsonrpc-client-connection>
+	</a2a:client-config>
+
+	<!-- Cliente MCP hacia el MCP de reservas (nombre sin guiones: el LLM ve las tools como <config>__<tool>) -->
+	<mcp:client-config name="aerolinea_reservas" doc:name="MCP Client reservas" clientName="aerolinea-agente" clientVersion="${aerolinea.agente.version}">
+		<mcp:streamable-http-client-connection serverUrl="http://${poc.host}:${poc.http.puerto}" mcpEndpointPath="${poc.rutas.aerolinea.mcpReservas}" requestTimeout="${poc.timeouts.mcpSegundos}">
+			<mcp:default-request-headers>
+				<mcp:default-request-header key="X-API-Key" value="${poc.seguridad.apiKey}" />
+			</mcp:default-request-headers>
+		</mcp:streamable-http-client-connection>
+	</mcp:client-config>
+
+	<!-- LLM: Ollama Cloud a través del conector MuleSoft Inference -->
+	<ms-inference:text-generation-config name="aerolinea-llm-config" doc:name="LLM Ollama aerolínea">
+		<ms-inference:ollama-connection ollamaModelName="${poc.llm.modelo}" ollamaUrl="${poc.llm.url}" apiKey="${poc.llm.apiKey}" timeout="${poc.timeouts.llmSegundos}" maxTokens="${poc.llm.maxTokens}" temperature="${poc.llm.temperatura}" />
+	</ms-inference:text-generation-config>
+
+	<!-- ============================================================================================ -->
+	<!-- Task Listener A2A                                                                             -->
+	<!-- ============================================================================================ -->
+	<flow name="aerolinea-agente-task-listener">
+		<a2a:task-listener doc:name="A2A Task Listener" config-ref="aerolinea-agente-a2a-server" />
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-agente', dominio: 'AEROLINEA'}]" />
+
+		<ee:transform doc:name="Contexto A2A y trazabilidad">
+			<ee:variables>
+				<ee:set-variable variableName="cabecerasEntrada"><![CDATA[%dw 2.0
+output application/java
+---
+attributes.headers]]></ee:set-variable>
+				<ee:set-variable variableName="correlationIdEntrante"><![CDATA[%dw 2.0
+output application/java
+---
+payload.message.metadata.correlationId default null]]></ee:set-variable>
+				<ee:set-variable variableName="a2aCtx"><![CDATA[%dw 2.0
+output application/java
+---
+{taskId: attributes.taskId, contextId: attributes.contextId, operacion: (attributes.operationName default "") as String}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="a2a-task-recibida" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Tarea A2A recibida', datos: {remitente: attributes.remoteAddress, cabeceras: attributes.headers, mensaje: payload.message}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="seguridad" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+
+		<!-- 1. Interpretar la solicitud: DataPart {accion, datos} -->
+		<set-variable doc:name="Paso" variableName="pasoActual" value="interpretar-solicitud" />
+		<ee:transform doc:name="Extraer solicitud">
+			<ee:variables>
+				<ee:set-variable variableName="solicitud"><![CDATA[%dw 2.0
+output application/java
+import try from dw::Runtime
+var partes = payload.message.parts default []
+var desdeData = (partes filter ($.data != null))[0].data
+var desdeTexto = ((partes filter ($.text != null)) map try(() -> read($.text, "application/json")) filter ($.success and ($.result is Object)) map $.result)[0]
+---
+(desdeData default desdeTexto) default {}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<ee:transform doc:name="Acción y datos">
+			<ee:variables>
+				<ee:set-variable variableName="accion"><![CDATA[%dw 2.0
+output application/java
+---
+lower(trim((vars.solicitud.accion default "") as String))]]></ee:set-variable>
+				<ee:set-variable variableName="datos"><![CDATA[%dw 2.0
+output application/java
+---
+(vars.solicitud.datos default {}) as Object]]></ee:set-variable>
+				<ee:set-variable variableName="localizador"><![CDATA[%dw 2.0
+output application/java
+---
+if (vars.solicitud.datos.localizador != null) upper(trim(vars.solicitud.datos.localizador as String)) else null]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<set-variable doc:name="Log DECISION" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'DECISION', mensaje: 'Acción solicitada: ' ++ vars.accion, datos: vars.datos}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<choice doc:name="¿Acción soportada?">
+			<when expression="#[not (['buscar_vuelos', 'reservar_vuelo', 'buscar_parking', 'reservar_parking', 'pagar_reserva', 'consultar_reserva'] contains vars.accion)]">
+				<raise-error doc:name="Acción no soportada" type="AEROLINEA:ACCION_NO_SOPORTADA" description="#['Acción no soportada por el agente de la aerolínea: ' ++ (if (vars.accion == '') '(vacía)' else vars.accion) ++ '. El mensaje debe traer un DataPart {accion, datos}. Acciones: buscar_vuelos, reservar_vuelo, buscar_parking, reservar_parking, pagar_reserva, consultar_reserva']" />
+			</when>
+		</choice>
+		<set-variable doc:name="Sin resultado" variableName="resultado" value="#[null]" />
+		<set-variable doc:name="Origen reservas" variableName="origenReservas" value="NO_APLICA" />
+
+		<!-- 2. Orquestación por acción. Un paso solo se ejecuta si el anterior no ha dejado ya un resultado
+		        (vars.resultado != null significa "terminado", p. ej. con un error de negocio). -->
+		<choice doc:name="Acción">
+			<!-- ======================= buscar_vuelos ======================= -->
+			<when expression="#[vars.accion == 'buscar_vuelos']">
+				<set-variable doc:name="Petición AENA" variableName="peticionAena" value="#[output application/java --- {accion: 'buscar_vuelos', argumentos: {origen: vars.datos.origen, destino: vars.datos.destino, fecha: vars.datos.fecha, pasajeros: (vars.datos.pasajeros default 1) as Number}}]" />
+				<flow-ref doc:name="aerolinea-llamar-aena" name="aerolinea-llamar-aena" />
+				<set-variable doc:name="Resultado" variableName="resultado" value="#[vars.respuestaAena.resultado]" />
+			</when>
+
+			<!-- ======================= reservar_vuelo ======================= -->
+			<when expression="#[vars.accion == 'reservar_vuelo']">
+				<set-variable doc:name="Petición AENA" variableName="peticionAena" value="#[output application/java --- {accion: 'consultar_vuelo', argumentos: {vueloId: vars.datos.vueloId, pasajeros: (vars.datos.pasajeros default 1) as Number}}]" />
+				<flow-ref doc:name="aerolinea-llamar-aena" name="aerolinea-llamar-aena" />
+				<choice doc:name="¿Vuelo reservable?">
+					<when expression="#[vars.respuestaAena.resultado.tipo == 'error']">
+						<set-variable doc:name="Resultado error" variableName="resultado" value="#[vars.respuestaAena.resultado]" />
+					</when>
+					<when expression="#[not (vars.respuestaAena.resultado.vuelo.disponible default false)]">
+						<set-variable doc:name="Sin plazas" variableName="resultado" value="#[output application/java --- {tipo: 'error', codigo: 'SIN_PLAZAS', mensaje: 'El vuelo ' ++ (vars.respuestaAena.resultado.vuelo.numeroVuelo default '') ++ ' solo tiene ' ++ ((vars.respuestaAena.resultado.vuelo.plazasLibres default 0) as String) ++ ' plazas libres. Elige otro vuelo.'}]" />
+					</when>
+					<otherwise>
+						<set-variable doc:name="Operación reservas" variableName="opReservas" value="#[output application/java --- {tool: 'crear_reserva', argumentos: {vuelo: vars.respuestaAena.resultado.vuelo, pasajeros: (vars.datos.pasajeros default 1) as Number, titular: vars.datos.titular default {}, correlationId: vars.correlationId}}]" />
+						<flow-ref doc:name="aerolinea-reservas-escritura" name="aerolinea-reservas-escritura" />
+						<set-variable doc:name="Resultado" variableName="resultado" value="#[vars.resultadoReservas]" />
+					</otherwise>
+				</choice>
+			</when>
+
+			<!-- ======================= buscar_parking ======================= -->
+			<when expression="#[vars.accion == 'buscar_parking']">
+				<set-variable doc:name="Sin reserva" variableName="reserva" value="#[null]" />
+				<choice doc:name="¿Completar con la reserva?">
+					<when expression="#[vars.localizador != null]">
+						<flow-ref doc:name="aerolinea-consultar-reserva" name="aerolinea-consultar-reserva" />
+						<choice doc:name="¿Existe la reserva?">
+							<when expression="#[vars.reserva.tipo == 'error']">
+								<set-variable doc:name="Resultado error" variableName="resultado" value="#[vars.reserva]" />
+							</when>
+						</choice>
+					</when>
+				</choice>
+				<choice doc:name="¿Continuar?">
+					<when expression="#[vars.resultado == null]">
+						<set-variable doc:name="Argumentos parking" variableName="argsParking" value="#[output application/java --- {aeropuerto: vars.datos.aeropuerto default vars.reserva.vuelo.origen.codigo, fechaEntrada: vars.datos.fechaEntrada default (if (vars.reserva.vuelo.salida != null) (vars.reserva.vuelo.salida as String)[0 to 9] else null), fechaSalida: vars.datos.fechaSalida}]" />
+						<choice doc:name="¿Datos completos?">
+							<when expression="#[vars.argsParking.aeropuerto == null or vars.argsParking.fechaEntrada == null or vars.argsParking.fechaSalida == null]">
+								<set-variable doc:name="Faltan datos" variableName="resultado" value="#[output application/java --- {tipo: 'error', codigo: 'FALTAN_DATOS_PARKING', mensaje: 'Para buscar parking necesito el aeropuerto, la fecha de entrada y la fecha de salida (cuándo se recoge el coche). Si hay reserva, el aeropuerto y la entrada se toman del vuelo; falta: ' ++ ((['aeropuerto', 'fechaEntrada', 'fechaSalida'] filter (vars.argsParking[$] == null)) joinBy ', ')}]" />
+							</when>
+							<otherwise>
+								<set-variable doc:name="Petición AENA" variableName="peticionAena" value="#[output application/java --- {accion: 'buscar_parking', argumentos: vars.argsParking}]" />
+								<flow-ref doc:name="aerolinea-llamar-aena" name="aerolinea-llamar-aena" />
+								<set-variable doc:name="Resultado" variableName="resultado" value="#[vars.respuestaAena.resultado]" />
+							</otherwise>
+						</choice>
+					</when>
+				</choice>
+			</when>
+
+			<!-- ======================= reservar_parking ======================= -->
+			<when expression="#[vars.accion == 'reservar_parking']">
+				<flow-ref doc:name="aerolinea-consultar-reserva" name="aerolinea-consultar-reserva" />
+				<choice doc:name="¿Reserva modificable?">
+					<when expression="#[vars.reserva.tipo == 'error']">
+						<set-variable doc:name="Resultado error" variableName="resultado" value="#[vars.reserva]" />
+					</when>
+					<when expression="#[vars.reserva.estado != 'PENDIENTE_PAGO' or vars.reserva.pago.estado == 'PENDIENTE']">
+						<set-variable doc:name="No modificable" variableName="resultado" value="#[output application/java --- {tipo: 'error', codigo: 'RESERVA_NO_MODIFICABLE', mensaje: 'La reserva ' ++ vars.localizador ++ ' está ' ++ (if (vars.reserva.pago.estado == 'PENDIENTE') 'con un pago en curso' else (vars.reserva.estado as String)) ++ ': el parking hay que añadirlo antes de pagar.'}]" />
+					</when>
+					<otherwise>
+						<set-variable doc:name="Petición AENA" variableName="peticionAena" value="#[output application/java --- {accion: 'reservar_parking', argumentos: {aeropuerto: vars.datos.aeropuerto default vars.reserva.vuelo.origen.codigo, opcionId: upper((vars.datos.opcionId default '') as String), fechaEntrada: vars.datos.fechaEntrada default (vars.reserva.vuelo.salida as String)[0 to 9], fechaSalida: vars.datos.fechaSalida, (matricula: vars.datos.matricula) if (vars.datos.matricula != null), referencia: vars.localizador}}]" />
+						<flow-ref doc:name="aerolinea-llamar-aena" name="aerolinea-llamar-aena" />
+						<choice doc:name="¿Parking reservado?">
+							<when expression="#[vars.respuestaAena.resultado.tipo == 'parking_reserva']">
+								<set-variable doc:name="Operación reservas" variableName="opReservas" value="#[output application/java --- {tool: 'actualizar_reserva', argumentos: {localizador: vars.localizador, parking: vars.respuestaAena.resultado, correlationId: vars.correlationId}}]" />
+								<flow-ref doc:name="aerolinea-reservas-escritura" name="aerolinea-reservas-escritura" />
+								<set-variable doc:name="Resultado" variableName="resultado" value="#[vars.resultadoReservas]" />
+							</when>
+							<otherwise>
+								<set-variable doc:name="Resultado AENA" variableName="resultado" value="#[vars.respuestaAena.resultado]" />
+							</otherwise>
+						</choice>
+					</otherwise>
+				</choice>
+			</when>
+
+			<!-- ======================= pagar_reserva ======================= -->
+			<when expression="#[vars.accion == 'pagar_reserva']">
+				<flow-ref doc:name="aerolinea-consultar-reserva" name="aerolinea-consultar-reserva" />
+				<choice doc:name="¿Hay que crear el pago?">
+					<when expression="#[vars.reserva.tipo == 'error']">
+						<set-variable doc:name="Resultado error" variableName="resultado" value="#[vars.reserva]" />
+					</when>
+					<when expression="#[vars.reserva.estado != 'PENDIENTE_PAGO' or vars.reserva.pago.estado == 'PENDIENTE']">
+						<!-- Ya pagada o con un enlace de pago vigente: se devuelve tal cual (el resumen lo explica) -->
+						<set-variable doc:name="Resultado reserva" variableName="resultado" value="#[vars.reserva]" />
+					</when>
+					<otherwise>
+						<set-variable doc:name="Petición AENA" variableName="peticionAena" value="#[output application/java --- {accion: 'crear_pago', argumentos: {referencia: vars.localizador, importe: vars.reserva.importes.total, concepto: 'Reserva ' ++ vars.localizador ++ ': vuelo ' ++ (vars.reserva.vuelo.numeroVuelo default '') ++ ' ' ++ (vars.reserva.vuelo.origen.codigo default '') ++ '-' ++ (vars.reserva.vuelo.destino.codigo default '') ++ (if (vars.reserva.parking != null) ' + parking AENA' else '')}}]" />
+						<flow-ref doc:name="aerolinea-llamar-aena" name="aerolinea-llamar-aena" />
+						<choice doc:name="¿Pago creado?">
+							<when expression="#[vars.respuestaAena.resultado.tipo == 'pago']">
+								<set-variable doc:name="Operación reservas" variableName="opReservas" value="#[output application/java --- {tool: 'actualizar_reserva', argumentos: {localizador: vars.localizador, pago: vars.respuestaAena.resultado - 'tipo', correlationId: vars.correlationId}}]" />
+								<flow-ref doc:name="aerolinea-reservas-escritura" name="aerolinea-reservas-escritura" />
+								<set-variable doc:name="Resultado" variableName="resultado" value="#[vars.resultadoReservas]" />
+							</when>
+							<otherwise>
+								<set-variable doc:name="Resultado AENA" variableName="resultado" value="#[vars.respuestaAena.resultado]" />
+							</otherwise>
+						</choice>
+					</otherwise>
+				</choice>
+			</when>
+
+			<!-- ======================= consultar_reserva ======================= -->
+			<otherwise>
+				<flow-ref doc:name="aerolinea-consultar-reserva" name="aerolinea-consultar-reserva" />
+				<set-variable doc:name="Resultado reserva" variableName="resultado" value="#[vars.reserva]" />
+				<choice doc:name="¿Pago pendiente?">
+					<when expression="#[vars.reserva.tipo == 'reserva' and vars.reserva.pago.idPago != null and vars.reserva.pago.estado == 'PENDIENTE']">
+						<set-variable doc:name="Petición AENA" variableName="peticionAena" value="#[output application/java --- {accion: 'estado_pago', argumentos: {idPago: vars.reserva.pago.idPago}}]" />
+						<flow-ref doc:name="aerolinea-llamar-aena" name="aerolinea-llamar-aena" />
+						<choice doc:name="¿Ha cambiado el pago?">
+							<when expression="#[vars.respuestaAena.resultado.tipo == 'pago' and vars.respuestaAena.resultado.estado != 'PENDIENTE']">
+								<set-variable doc:name="Operación reservas" variableName="opReservas" value="#[output application/java --- {tool: 'actualizar_reserva', argumentos: {localizador: vars.localizador, pago: vars.respuestaAena.resultado - 'tipo', estado: if (vars.respuestaAena.resultado.estado == 'PAGADO') 'CONFIRMADA' else 'PENDIENTE_PAGO', correlationId: vars.correlationId}}]" />
+								<flow-ref doc:name="aerolinea-reservas-escritura" name="aerolinea-reservas-escritura" />
+								<set-variable doc:name="Resultado" variableName="resultado" value="#[vars.resultadoReservas]" />
+							</when>
+						</choice>
+					</when>
+				</choice>
+			</otherwise>
+		</choice>
+
+		<!-- 3. Respuesta A2A -->
+		<set-variable doc:name="Paso" variableName="pasoActual" value="responder-task" />
+		<ee:transform doc:name="Resumen para el cliente">
+			<ee:variables>
+				<ee:set-variable variableName="resumen" resource="dwl/aerolinea/resumen.dwl" />
+			</ee:variables>
+		</ee:transform>
+		<ee:transform doc:name="Construir Task">
+			<ee:variables>
+				<ee:set-variable variableName="taskRespuesta"><![CDATA[%dw 2.0
+output application/json skipNullOn="everywhere"
+---
+{
+    status: {
+        state: "TASK_STATE_COMPLETED",
+        message: {role: "ROLE_AGENT", messageId: uuid(), parts: [{text: vars.resumen}]}
+    },
+    artifact: {
+        artifactId: uuid(),
+        name: "resultado-aerolinea",
+        description: "Resultado de la acción " ++ vars.accion,
+        parts: [
+            {data: vars.resultado, mediaType: "application/json"},
+            {text: vars.resumen}
+        ]
+    },
+    metadata: {
+        correlationId: vars.correlationId,
+        accion: vars.accion,
+        origenReservas: vars.origenReservas,
+        modeloLlm: if (p('aerolinea.agente.usarLlm') == 'true') p('poc.llm.modelo') else null
+    }
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<a2a:update-task-artifact doc:name="Artifact resultado-aerolinea" config-ref="aerolinea-agente-a2a-server">
+			<a2a:artifact-content><![CDATA[#[output application/json skipNullOn="everywhere" --- {artifactUpdate: {taskId: vars.a2aCtx.taskId, contextId: vars.a2aCtx.contextId, artifact: vars.taskRespuesta.artifact}}]]]></a2a:artifact-content>
+		</a2a:update-task-artifact>
+		<a2a:set-task-metadata doc:name="Metadata de trazabilidad" config-ref="aerolinea-agente-a2a-server" taskId="#[vars.a2aCtx.taskId]">
+			<a2a:metadata><![CDATA[#[output application/json --- vars.taskRespuesta.metadata]]]></a2a:metadata>
+		</a2a:set-task-metadata>
+		<set-variable doc:name="Log FIN" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'FIN', mensaje: 'Task A2A completada', datos: {accion: vars.accion, tipoResultado: vars.resultado.tipo, origenReservas: vars.origenReservas, resumen: vars.resumen}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<a2a:update-task-status doc:name="Estado COMPLETED" config-ref="aerolinea-agente-a2a-server">
+			<a2a:status-content><![CDATA[#[output application/json --- {statusUpdate: {taskId: vars.a2aCtx.taskId, contextId: vars.a2aCtx.contextId, status: vars.taskRespuesta.status}}]]]></a2a:status-content>
+		</a2a:update-task-status>
+
+		<error-handler>
+			<on-error-continue type="POC:NO_AUTORIZADO" logException="false">
+				<a2a:update-task-status doc:name="Estado REJECTED" config-ref="aerolinea-agente-a2a-server">
+					<a2a:status-content><![CDATA[#[%dw 2.0
+output application/json
+---
+{
+    statusUpdate: {
+        taskId: vars.a2aCtx.taskId,
+        contextId: vars.a2aCtx.contextId,
+        status: {
+            state: "TASK_STATE_REJECTED",
+            message: {
+                role: "ROLE_AGENT",
+                messageId: uuid(),
+                parts: [{ text: error.description default "No autorizado" }]
+            }
+        }
+    }
+}]]]></a2a:status-content>
+				</a2a:update-task-status>
+			</on-error-continue>
+			<on-error-continue type="ANY" logException="true">
+				<flow-ref doc:name="poc-log-error" name="poc-log-error" />
+				<a2a:update-task-status doc:name="Estado FAILED" config-ref="aerolinea-agente-a2a-server">
+					<a2a:status-content><![CDATA[#[%dw 2.0
+output application/json
+---
+{
+    statusUpdate: {
+        taskId: vars.a2aCtx.taskId,
+        contextId: vars.a2aCtx.contextId,
+        status: {
+            state: "TASK_STATE_FAILED",
+            message: {
+                role: "ROLE_AGENT",
+                messageId: uuid(),
+                parts: [{ text: "La aerolínea no ha podido completar la operación: " ++ (error.description default "error desconocido") ++ " (correlationId: " ++ (vars.correlationId default "") ++ ")" }]
+            }
+        }
+    }
+}]]]></a2a:status-content>
+				</a2a:update-task-status>
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- A2A a AENA. Entrada: vars.peticionAena = {accion, argumentos}                                  -->
+	<!-- Salida: vars.respuestaAena = {estado, taskId, mensajeAgente, resultado}. Lanza AEROLINEA:AENA_NO_DISPONIBLE
+	     si la Task no termina COMPLETED o no trae resultado.                                          -->
+	<!-- ============================================================================================ -->
+	<sub-flow name="aerolinea-llamar-aena">
+		<set-variable doc:name="Paso" variableName="pasoActual" value="#['a2a-aena-' ++ vars.peticionAena.accion]" />
+		<ee:transform doc:name="Mensaje A2A">
+			<ee:variables>
+				<ee:set-variable variableName="mensajeA2a"><![CDATA[%dw 2.0
+output application/json
+---
+{
+    message: {
+        messageId: uuid(),
+        role: "ROLE_USER",
+        metadata: {
+            correlationId: vars.correlationId,
+            agenteOrigen: vars.segmento.nombre
+        },
+        parts: [
+            {
+                data: {accion: vars.peticionAena.accion, argumentos: vars.peticionAena.argumentos},
+                mediaType: "application/json"
+            },
+            {
+                text: "La aerolínea solicita a AENA la acción " ++ (vars.peticionAena.accion as String) ++ "."
+            }
+        ]
+    }
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: 'aerolinea-llamar-aena', nivel: 'INFO', paso: vars.pasoActual, fase: 'LLAMADA_SALIENTE', mensaje: 'A2A SendMessage al agente de AENA: ' ++ vars.peticionAena.accion, datos: {agente: 'http://' ++ p('poc.host') ++ ':' ++ p('poc.http.puerto') ++ p('poc.rutas.aena.agente'), peticion: vars.peticionAena}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<a2a:send-message doc:name="A2A Send Message (AENA)" config-ref="aena-agente-a2a-client" target="respuestaAenaA2a">
+			<a2a:message><![CDATA[#[vars.mensajeA2a]]]></a2a:message>
+			<a2a:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></a2a:additional-properties>
+		</a2a:send-message>
+		<ee:transform doc:name="Interpretar respuesta A2A">
+			<ee:variables>
+				<ee:set-variable variableName="respuestaAena"><![CDATA[%dw 2.0
+output application/java
+import * from dwl::comun::utilidades
+var task = taskA2a(vars.respuestaAenaA2a)
+---
+{
+    estado: task.status.state default null,
+    taskId: task.id default null,
+    mensajeAgente: textosDe(task.status.message.parts),
+    resultado: resultadoNegocio(task.artifacts default vars.respuestaAenaA2a)
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: 'aerolinea-llamar-aena', nivel: 'INFO', paso: vars.pasoActual, fase: 'RESPUESTA', mensaje: 'Respuesta A2A del agente de AENA: ' ++ (vars.respuestaAena.estado default 'sin estado'), datos: vars.respuestaAena}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<set-variable doc:name="Log detalle A2A" variableName="logEvt" value="#[output application/java --- {flujo: 'aerolinea-llamar-aena', nivel: 'DEBUG', paso: vars.pasoActual, fase: 'RESPUESTA', mensaje: 'Respuesta A2A completa', datos: vars.respuestaAenaA2a}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<choice doc:name="¿AENA respondió?">
+			<when expression="#[vars.respuestaAena.estado != 'TASK_STATE_COMPLETED' or vars.respuestaAena.resultado == null]">
+				<raise-error doc:name="AENA no disponible" type="AEROLINEA:AENA_NO_DISPONIBLE" description="#['El agente de AENA no ha completado la acción ' ++ vars.peticionAena.accion ++ ' (estado ' ++ (vars.respuestaAena.estado default 'desconocido') ++ '): ' ++ (vars.respuestaAena.mensajeAgente default '')]" />
+			</when>
+		</choice>
+	</sub-flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Lectura de la reserva (directa, sin LLM). Entrada: vars.localizador. Salida: vars.reserva      -->
+	<!-- ============================================================================================ -->
+	<sub-flow name="aerolinea-consultar-reserva">
+		<choice doc:name="¿Hay localizador?">
+			<when expression="#[vars.localizador == null or vars.localizador == '']">
+				<set-variable doc:name="Falta localizador" variableName="reserva" value="#[output application/java --- {tipo: 'error', codigo: 'FALTA_LOCALIZADOR', mensaje: 'Falta el localizador de la reserva'}]" />
+			</when>
+			<otherwise>
+				<set-variable doc:name="Paso" variableName="pasoActual" value="mcp-consultar-reserva" />
+				<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: 'aerolinea-consultar-reserva', nivel: 'INFO', paso: vars.pasoActual, fase: 'LLAMADA_SALIENTE', mensaje: 'MCP call-tool consultar_reserva', datos: {localizador: vars.localizador}}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+				<mcp:call-tool doc:name="consultar_reserva" config-ref="aerolinea_reservas" toolName="consultar_reserva" extractStructuredContent="true" target="respuestaReservasMcp">
+					<mcp:arguments><![CDATA[#[output application/java --- {localizador: vars.localizador, correlationId: vars.correlationId}]]]></mcp:arguments>
+					<mcp:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></mcp:additional-properties>
+				</mcp:call-tool>
+				<ee:transform doc:name="Reserva">
+					<ee:variables>
+						<ee:set-variable variableName="reserva"><![CDATA[%dw 2.0
+output application/java
+import * from dwl::comun::utilidades
+---
+resultadoNegocio(vars.respuestaReservasMcp) default {tipo: "error", codigo: "RESERVAS_SIN_RESPUESTA", mensaje: "El sistema de reservas no ha devuelto la reserva"}]]></ee:set-variable>
+					</ee:variables>
+				</ee:transform>
+				<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: 'aerolinea-consultar-reserva', nivel: 'INFO', paso: vars.pasoActual, fase: 'RESPUESTA', mensaje: 'Reserva: ' ++ ((vars.reserva.estado default vars.reserva.codigo default '') as String), datos: vars.reserva}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+			</otherwise>
+		</choice>
+	</sub-flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Escritura en reservas: el LLM decide la tool del MCP de reservas (con salvaguarda determinista). -->
+	<!-- Entrada: vars.opReservas = {tool, argumentos}. Salida: vars.resultadoReservas, vars.origenReservas -->
+	<!-- ============================================================================================ -->
+	<sub-flow name="aerolinea-reservas-escritura">
+		<set-variable doc:name="Paso" variableName="pasoActual" value="#['reservas-' ++ vars.opReservas.tool]" />
+		<set-variable doc:name="Sin resultado" variableName="resultadoReservas" value="#[null]" />
+		<set-variable doc:name="Origen" variableName="origenReservas" value="TOOL_DIRECTA" />
+		<choice doc:name="¿Usar LLM?">
+			<when expression="#[p('aerolinea.agente.usarLlm') == 'true']">
+				<set-variable doc:name="Entrada LLM" variableName="entradaLlm" value="#[write({operacion: vars.opReservas.tool, argumentos: vars.opReservas.argumentos}, 'application/json')]" />
+				<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: 'aerolinea-reservas-escritura', nivel: 'INFO', paso: vars.pasoActual, fase: 'LLAMADA_SALIENTE', mensaje: 'Consulta al LLM con las tools del MCP de reservas', datos: {modelo: p('poc.llm.modelo'), entrada: vars.entradaLlm}}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+				<try doc:name="LLM con reintento">
+					<until-successful doc:name="Reintentos LLM" maxRetries="${aerolinea.agente.reintentosLlm}" millisBetweenRetries="500">
+						<ms-inference:mcp-tools-native-template doc:name="[MCP] Tooling" config-ref="aerolinea-llm-config" target="respuestaLlm" targetValue="#[output application/java --- {respuesta: payload, atributos: attributes}]">
+							<ms-inference:mcp-config-references>
+								<ms-inference:mcp-config mcpClientConfigRef="aerolinea_reservas" />
+							</ms-inference:mcp-config-references>
+							<ms-inference:template><![CDATA[Eres el agente de atención al cliente de una aerolínea. Gestionas el sistema de reservas de la compañía usando SIEMPRE las herramientas disponibles.]]></ms-inference:template>
+							<ms-inference:instructions><![CDATA[La solicitud es un JSON con "operacion" (el nombre exacto de la herramienta de reservas que debes usar) y "argumentos". Invoca UNA sola vez esa herramienta pasándole los "argumentos" tal cual: copia completos y sin modificar los objetos (vuelo, titular, parking, pago) y todos los valores, e incluye el correlationId. No llames a ninguna otra herramienta y no inventes datos.]]></ms-inference:instructions>
+							<ms-inference:data><![CDATA[#[vars.entradaLlm]]]></ms-inference:data>
+						</ms-inference:mcp-tools-native-template>
+					</until-successful>
+					<error-handler>
+						<on-error-continue type="ANY" logException="false">
+							<set-variable doc:name="Log WARN" variableName="logEvt" value="#[output application/java --- {flujo: 'aerolinea-reservas-escritura', nivel: 'WARN', paso: vars.pasoActual, fase: 'RESPUESTA', mensaje: 'El LLM no completó la llamada a la tool tras los reintentos', datos: {tipoError: (error.errorType.namespace default '') ++ ':' ++ (error.errorType.identifier default ''), descripcion: error.description, pista: 'Mira el ERROR previo del conector com.mulesoft.connectors.inference: 401 = API key de Ollama no válida (poc.llm.apiKey); PKIX = certificado TLS no confiable (con proxy corporativo falta -Djavax.net.ssl.trustStoreType=Windows-ROOT)'}}]" />
+							<flow-ref doc:name="poc-log" name="poc-log" />
+							<set-variable doc:name="Sin respuesta LLM" variableName="respuestaLlm" value="#[null]" />
+						</on-error-continue>
+					</error-handler>
+				</try>
+				<ee:transform doc:name="Resultado del LLM">
+					<ee:variables>
+						<ee:set-variable variableName="resultadoReservas"><![CDATA[%dw 2.0
+output application/java
+import * from dwl::comun::utilidades
+---
+if (vars.respuestaLlm == null) null else resultadoToolLlm(vars.respuestaLlm.respuesta, vars.opReservas.tool as String)]]></ee:set-variable>
+						<ee:set-variable variableName="toolsLlm"><![CDATA[%dw 2.0
+output application/java
+import * from dwl::comun::utilidades
+---
+if (vars.respuestaLlm == null) [] else toolsEjecutadas(vars.respuestaLlm.respuesta)]]></ee:set-variable>
+					</ee:variables>
+				</ee:transform>
+				<set-variable doc:name="Origen" variableName="origenReservas" value="LLM_MCP" />
+				<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: 'aerolinea-reservas-escritura', nivel: 'INFO', paso: vars.pasoActual, fase: 'RESPUESTA', mensaje: 'Respuesta del LLM: tools decididas y resultado de su ejecución vía MCP', datos: {toolsEjecutadasPorLlm: vars.toolsLlm, resultado: vars.resultadoReservas, textoLlm: vars.respuestaLlm.respuesta.response default null, consumoTokens: vars.respuestaLlm.atributos.tokenUsage default null}}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+			</when>
+		</choice>
+		<choice doc:name="¿Resultado obtenido?">
+			<when expression="#[vars.resultadoReservas == null and (p('aerolinea.agente.usarLlm') != 'true' or p('aerolinea.agente.fallbackDeterminista') == 'true')]">
+				<set-variable doc:name="Origen" variableName="origenReservas" value="#[if (p('aerolinea.agente.usarLlm') == 'true') 'FALLBACK_TOOL_DIRECTA' else 'TOOL_DIRECTA']" />
+				<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: 'aerolinea-reservas-escritura', nivel: if (vars.origenReservas == 'FALLBACK_TOOL_DIRECTA') 'WARN' else 'INFO', paso: vars.pasoActual, fase: 'LLAMADA_SALIENTE', mensaje: 'MCP call-tool ' ++ vars.opReservas.tool ++ (if (vars.origenReservas == 'FALLBACK_TOOL_DIRECTA') ' (el LLM no devolvió resultado)' else ''), datos: vars.opReservas.argumentos}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+				<choice doc:name="Tool">
+					<when expression="#[vars.opReservas.tool == 'crear_reserva']">
+						<mcp:call-tool doc:name="crear_reserva" config-ref="aerolinea_reservas" toolName="crear_reserva" extractStructuredContent="true" target="respuestaReservasMcp">
+							<mcp:arguments><![CDATA[#[output application/java --- vars.opReservas.argumentos]]]></mcp:arguments>
+							<mcp:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></mcp:additional-properties>
+						</mcp:call-tool>
+					</when>
+					<otherwise>
+						<mcp:call-tool doc:name="actualizar_reserva" config-ref="aerolinea_reservas" toolName="actualizar_reserva" extractStructuredContent="true" target="respuestaReservasMcp">
+							<mcp:arguments><![CDATA[#[output application/java --- vars.opReservas.argumentos]]]></mcp:arguments>
+							<mcp:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></mcp:additional-properties>
+						</mcp:call-tool>
+					</otherwise>
+				</choice>
+				<ee:transform doc:name="Resultado de la tool">
+					<ee:variables>
+						<ee:set-variable variableName="resultadoReservas"><![CDATA[%dw 2.0
+output application/java
+import * from dwl::comun::utilidades
+---
+resultadoNegocio(vars.respuestaReservasMcp)]]></ee:set-variable>
+					</ee:variables>
+				</ee:transform>
+				<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: 'aerolinea-reservas-escritura', nivel: 'INFO', paso: vars.pasoActual, fase: 'RESPUESTA', mensaje: 'Resultado de la tool ' ++ vars.opReservas.tool, datos: vars.resultadoReservas}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+			</when>
+		</choice>
+		<choice doc:name="¿Hay resultado?">
+			<when expression="#[vars.resultadoReservas == null]">
+				<raise-error doc:name="Sin resultado" type="AEROLINEA:RESERVAS_SIN_RESPUESTA" description="#['El sistema de reservas no ha devuelto resultado para ' ++ vars.opReservas.tool]" />
+			</when>
+		</choice>
+	</sub-flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Seguridad: autoriza el resto de operaciones A2A (GetTask, ListTasks, CancelTask, ...)          -->
+	<!-- ============================================================================================ -->
+	<flow name="aerolinea-agente-autorizar-operaciones">
+		<a2a:task-authorizer-listener doc:name="A2A Task Authorizer" config-ref="aerolinea-agente-a2a-server" />
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-agente', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.headers]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<flow-ref doc:name="poc-validar-api-key" name="poc-validar-api-key" />
+		<choice doc:name="¿Autorizado?">
+			<when expression="#[vars.autorizacion.valido]">
+				<logger doc:name="Autorizado" level="TRACE" message="Operación A2A autorizada" />
+			</when>
+			<when expression="#[((attributes.operationName default '') as String) == 'ListTasks']">
+				<set-payload doc:name="Ninguna tarea visible" value="#[output application/json --- []]" />
+			</when>
+			<otherwise>
+				<raise-error doc:name="No autorizado" type="POC:NO_AUTORIZADO" description="#['No autorizado: ' ++ vars.autorizacion.motivo]" />
+			</otherwise>
+		</choice>
+		<error-handler>
+			<on-error-propagate type="POC:NO_AUTORIZADO" logException="false" />
+		</error-handler>
+	</flow>
+
+</mule>

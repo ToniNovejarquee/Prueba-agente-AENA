@@ -1,0 +1,250 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  comun.xml
+  Piezas comunes a todos los segmentos: trazabilidad, logging estructurado y gestión de errores.
+
+  Contrato de uso en cada flujo de entrada de un segmento:
+    1) <set-variable variableName="segmento" value="#[{nombre: 'aena-agente', dominio: 'AENA'}]"/>
+       <set-variable variableName="cabecerasEntrada" value="#[attributes.headers]"/>   (opcional)
+       <flow-ref name="poc-iniciar-trazabilidad"/>
+    2) En cada punto de log:
+         <set-variable variableName="logEvt" value="#[{flujo: flow.name, nivel: 'INFO', paso: '...', fase: 'INICIO', mensaje: '...', datos: payload}]"/>
+         <flow-ref name="poc-log"/>
+       (anteponer la cabecera DataWeave "output application/java" cuando la expresión mezcle payload JSON con datos Java)
+       Fases: INICIO | FIN | LLAMADA_SALIENTE | RESPUESTA | DECISION | ERROR
+       LLAMADA_SALIENTE arranca un cronómetro y RESPUESTA informa automáticamente de duracionMs.
+    3) Errores: <error-handler ref="poc-error-handler"/> o <flow-ref name="poc-log-error"/> dentro de un handler propio.
+       APIs REST: <error-handler ref="poc-api-error-handler"/> responde JSON {tipo: "error", codigo, mensaje}
+       con vars.httpStatus (401 si falta la API key, 500 en otro caso). El listener debe usar
+       <http:response statusCode="#[vars.httpStatus default 200]"/>.
+    4) Seguridad: todos los componentes exigen la API key de la POC en la cabecera X-API-Key.
+         <flow-ref name="poc-exigir-api-key"/>    lanza POC:NO_AUTORIZADO si la API key falta o no es válida
+       o <flow-ref name="poc-validar-api-key"/>   solo evalúa y deja el resultado en vars.autorizacion = {valido, motivo, configurada}
+       Las cabeceras se leen de vars.cabecerasEntrada (las mismas que usa poc-iniciar-trazabilidad).
+       Los logs nunca muestran el valor de Authorization (se sustituye por "****" siempre).
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!-- ============================================================================================ -->
+	<!-- Trazabilidad: resuelve el correlationId de extremo a extremo y marca el inicio del flujo      -->
+	<!-- Entrada opcional: vars.cabecerasEntrada (mapa de cabeceras) y vars.correlationIdEntrante      -->
+	<!-- ============================================================================================ -->
+	<sub-flow name="poc-iniciar-trazabilidad" doc:description="Resuelve vars.correlationId (cabecera > valor explícito > correlationId de Mule o UUID nuevo) y arranca el cronómetro del flujo">
+		<ee:transform doc:name="Resolver correlationId">
+			<ee:variables>
+				<ee:set-variable variableName="correlationId"><![CDATA[%dw 2.0
+output application/java
+var nombreCabecera = lower(p('poc.trazabilidad.cabeceraCorrelacion') default "x-correlation-id")
+var cabeceras = (vars.cabecerasEntrada default {}) as Object
+var desdeCabecera = (cabeceras filterObject ((valor, clave) -> lower(clave as String) == nombreCabecera) pluck $)[0]
+// Algunos orígenes (p. ej. el tool-listener MCP) usan como correlationId el id JSON-RPC ("n:2"), que no es
+// único entre sesiones: en ese caso se genera un UUID.
+var desdeMule = if (sizeOf((correlationId default "") as String) >= 16) correlationId else uuid()
+---
+((desdeCabecera default vars.correlationIdEntrante) default desdeMule) as String]]></ee:set-variable>
+				<ee:set-variable variableName="tInicioFlujo"><![CDATA[%dw 2.0
+output application/java
+---
+now() as Number {unit: "milliseconds"}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+	</sub-flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Log estructurado: una línea JSON por evento, con el mismo esquema en todos los segmentos          -->
+	<!-- Entrada: vars.logEvt = {flujo, nivel, paso, fase, mensaje, datos?, duracionMs?}                -->
+	<!-- ============================================================================================ -->
+	<sub-flow name="poc-log" doc:description="Emite un evento de log JSON aplicando nivel, enmascarado y truncado definidos en config/poc-global.yaml">
+		<ee:transform doc:name="Construir evento de log">
+			<ee:variables>
+				<ee:set-variable variableName="pocLog"><![CDATA[%dw 2.0
+output application/java
+import try from dw::Runtime
+var niveles = {TRACE: 0, DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40}
+var evt = vars.logEvt default {}
+var nivel = upper(evt.nivel default "INFO")
+var umbral = upper(p('poc.logging.nivel') default "INFO")
+var emitir = (niveles[nivel] default 20) >= (niveles[umbral] default 20)
+var camposSensibles = ((p('poc.logging.camposSensibles') default "") splitBy ",") map trim($)
+var enmascarar = (p('poc.logging.enmascararDatos') default "false") == "true"
+var incluirDatos = (p('poc.logging.incluirDatos') default "true") == "true"
+var maxChars = (p('poc.logging.maxCaracteresDatos') default "4000") as Number
+var ahora = now() as Number {unit: "milliseconds"}
+// Claves que NUNCA se escriben en el log, esté o no activado el enmascarado de datos personales
+var clavesSecretas = ["authorization", "proxy-authorization", "x-api-key"]
+fun sinSecretos(v) = v match {
+    case o is Object -> o mapObject ((valor, clave) -> {
+        (clave): if (clavesSecretas contains lower(clave as String)) "****" else sinSecretos(valor)
+    })
+    case a is Array -> a map sinSecretos($)
+    else -> v
+}
+fun ocultar(v) = v match {
+    case o is Object -> o mapObject ((valor, clave) -> {
+        (clave): if (camposSensibles contains (clave as String)) "****" else ocultar(valor)
+    })
+    case a is Array -> a map ocultar($)
+    else -> v
+}
+fun normalizar(d) = do {
+    var datos = sinSecretos(if (enmascarar) ocultar(d) else d)
+    var serializado = try(() -> write(datos, "application/json", {indent: false}) as String)
+    var texto = if (serializado.success) serializado.result else ("[datos no serializables a JSON: " ++ typeOf(d) as String ++ "]")
+    ---
+    if (!serializado.success) texto
+    else if (sizeOf(texto) > maxChars) (texto[0 to maxChars - 1] ++ "...[truncado, $(sizeOf(texto)) caracteres]")
+    else datos
+}
+var duracion = if (evt.duracionMs != null) evt.duracionMs
+               else if ((evt.fase default "") == "RESPUESTA" and vars.tLlamada != null) (ahora - vars.tLlamada)
+               else null
+---
+{
+    emitir: emitir,
+    nivel: nivel,
+    linea: if (!emitir) "" else write({
+        ts: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"},
+        nivel: nivel,
+        entorno: p('poc.entorno'),
+        dominio: vars.segmento.dominio default "n/a",
+        segmento: vars.segmento.nombre default "n/a",
+        flujo: evt.flujo default "n/a",
+        paso: evt.paso,
+        fase: evt.fase,
+        mensaje: evt.mensaje,
+        correlationId: vars.correlationId default correlationId,
+        (a2a: vars.a2aCtx) if (vars.a2aCtx != null),
+        (duracionMs: duracion) if (duracion != null),
+        (msDesdeInicioFlujo: ahora - vars.tInicioFlujo) if (vars.tInicioFlujo != null),
+        (datos: normalizar(evt.datos)) if (incluirDatos and evt.datos != null)
+    }, "application/json", {indent: false}) as String
+}]]></ee:set-variable>
+				<ee:set-variable variableName="tLlamada"><![CDATA[%dw 2.0
+output application/java
+---
+if (((vars.logEvt default {}).fase default "") == "LLAMADA_SALIENTE") now() as Number {unit: "milliseconds"} else vars.tLlamada]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<choice doc:name="Nivel del evento">
+			<when expression="#[vars.pocLog.emitir and vars.pocLog.nivel == 'ERROR']">
+				<logger doc:name="ERROR" level="ERROR" category="poc.traza" message="#[vars.pocLog.linea]" />
+			</when>
+			<when expression="#[vars.pocLog.emitir and vars.pocLog.nivel == 'WARN']">
+				<logger doc:name="WARN" level="WARN" category="poc.traza" message="#[vars.pocLog.linea]" />
+			</when>
+			<when expression="#[vars.pocLog.emitir and vars.pocLog.nivel == 'INFO']">
+				<logger doc:name="INFO" level="INFO" category="poc.traza" message="#[vars.pocLog.linea]" />
+			</when>
+			<when expression="#[vars.pocLog.emitir]">
+				<logger doc:name="DEBUG" level="DEBUG" category="poc.traza" message="#[vars.pocLog.linea]" />
+			</when>
+		</choice>
+		<remove-variable doc:name="Limpiar pocLog" variableName="pocLog" />
+		<remove-variable doc:name="Limpiar logEvt" variableName="logEvt" />
+	</sub-flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Seguridad: valida la API key de la POC (cabecera X-API-Key) contra poc.seguridad.apiKey.          -->
+	<!-- Entrada: vars.cabecerasEntrada (mapa de cabeceras)                                             -->
+	<!-- Salida:  vars.autorizacion = {valido, motivo, configurada}                                      -->
+	<!-- ============================================================================================ -->
+	<sub-flow name="poc-validar-api-key" doc:description="Comprueba la API key de la petición contra la configurada y registra la decisión (sin volcar la clave)">
+		<ee:transform doc:name="Comprobar API key">
+			<ee:variables>
+				<ee:set-variable variableName="autorizacion"><![CDATA[%dw 2.0
+output application/java
+var nombreCabecera = lower(p('poc.seguridad.cabecera') default "x-api-key")
+var cabeceras = (vars.cabecerasEntrada default {}) as Object
+var presentada = (cabeceras filterObject ((v, k) -> lower(k as String) == nombreCabecera) pluck $)[0]
+var esperada = p('poc.seguridad.apiKey')
+var configurada = (esperada != null) and (trim(esperada as String) != "")
+---
+{
+    configurada: configurada,
+    valido: configurada and (presentada != null) and ((presentada as String) == (esperada as String)),
+    motivo: if (not configurada) "El servidor no tiene configurada la API key (propiedad poc.seguridad.apiKey)"
+            else if ((presentada default "") == "") "Falta la cabecera X-API-Key"
+            else if ((presentada as String) != (esperada as String)) "API key no válida"
+            else "OK"
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<choice doc:name="¿Autorizado?">
+			<when expression="#[vars.autorizacion.valido]">
+				<set-variable doc:name="Log autorizado" variableName="logEvt" value="#[output application/java --- {flujo: 'poc-validar-api-key', nivel: 'DEBUG', paso: 'seguridad', fase: 'DECISION', mensaje: 'Acceso autorizado (API key válida)'}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+			</when>
+			<when expression="#[not vars.autorizacion.configurada]">
+				<set-variable doc:name="Log API key no configurada" variableName="logEvt" value="#[output application/java --- {flujo: 'poc-validar-api-key', nivel: 'ERROR', paso: 'seguridad', fase: 'DECISION', mensaje: 'Acceso rechazado: ' ++ vars.autorizacion.motivo}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+			</when>
+			<otherwise>
+				<set-variable doc:name="Log rechazado" variableName="logEvt" value="#[output application/java --- {flujo: 'poc-validar-api-key', nivel: 'WARN', paso: 'seguridad', fase: 'DECISION', mensaje: 'Acceso rechazado: ' ++ vars.autorizacion.motivo}]" />
+				<flow-ref doc:name="poc-log" name="poc-log" />
+			</otherwise>
+		</choice>
+	</sub-flow>
+
+	<sub-flow name="poc-exigir-api-key" doc:description="Como poc-validar-api-key, pero lanza POC:NO_AUTORIZADO si el acceso no está autorizado">
+		<flow-ref doc:name="poc-validar-api-key" name="poc-validar-api-key" />
+		<choice doc:name="¿Rechazar?">
+			<when expression="#[not vars.autorizacion.valido]">
+				<raise-error doc:name="No autorizado" type="POC:NO_AUTORIZADO" description="#['No autorizado: ' ++ vars.autorizacion.motivo]" />
+			</when>
+		</choice>
+	</sub-flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Log de error: vuelca tipo, descripción, componente y payload del error                       -->
+	<!-- ============================================================================================ -->
+	<sub-flow name="poc-log-error" doc:description="Emite un evento de log ERROR con el detalle del error actual">
+		<set-variable doc:name="Evento de error" variableName="logEvt" value="#[%dw 2.0
+output application/java
+---
+{
+    flujo: ((error.failingComponent default 'n/a') splitBy '/')[0],
+    nivel: 'ERROR',
+    paso: vars.pasoActual default 'desconocido',
+    fase: 'ERROR',
+    mensaje: error.description default 'Error sin descripción',
+    datos: {
+        tipo: (error.errorType.namespace default '') ++ ':' ++ (error.errorType.identifier default ''),
+        componente: error.failingComponent default null,
+        descripcionDetallada: error.detailedDescription default null,
+        payloadError: error.errorMessage.payload default null
+    }
+}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+	</sub-flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Manejador de errores común: registra y propaga                                                -->
+	<!-- ============================================================================================ -->
+	<error-handler name="poc-error-handler" doc:description="Registra el error con el formato común y lo propaga al llamante">
+		<on-error-propagate type="ANY" logException="true" enableNotifications="true">
+			<flow-ref doc:name="poc-log-error" name="poc-log-error" />
+		</on-error-propagate>
+	</error-handler>
+
+	<!-- ============================================================================================ -->
+	<!-- Manejador de errores de las APIs REST: responde JSON con el código HTTP adecuado              -->
+	<!-- (el listener devuelve vars.httpStatus en su http:response)                                    -->
+	<!-- ============================================================================================ -->
+	<error-handler name="poc-api-error-handler" doc:description="Responde 401 si falta o no es válida la API key y 500 ante cualquier otro error, siempre en JSON">
+		<on-error-continue type="POC:NO_AUTORIZADO" logException="false" enableNotifications="true">
+			<set-variable doc:name="HTTP 401" variableName="httpStatus" value="#[401]" />
+			<set-payload doc:name="Error 401" value="#[output application/json --- {tipo: 'error', codigo: 'NO_AUTORIZADO', mensaje: error.description default 'No autorizado'}]" />
+		</on-error-continue>
+		<on-error-continue type="ANY" logException="true" enableNotifications="true">
+			<flow-ref doc:name="poc-log-error" name="poc-log-error" />
+			<set-variable doc:name="HTTP 500" variableName="httpStatus" value="#[500]" />
+			<set-payload doc:name="Error 500" value="#[output application/json --- {tipo: 'error', codigo: 'ERROR_INTERNO', mensaje: error.description default 'Error interno', correlationId: vars.correlationId default correlationId}]" />
+		</on-error-continue>
+	</error-handler>
+
+</mule>

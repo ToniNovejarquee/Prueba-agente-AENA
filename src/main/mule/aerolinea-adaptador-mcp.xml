@@ -1,0 +1,436 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SEGMENTO AEROLÍNEA - aerolinea-adaptador-mcp  (ruta ${poc.rutas.aerolinea.mcpCopilot})  ("Adaptador MCP" del diagrama)
+  Servidor MCP (Streamable HTTP) que consume GitHub Copilot (chat de VS Code en modo Agent o app de escritorio).
+  Cada tool traduce la petición de Copilot a un mensaje A2A {accion, datos} para el agente de la aerolínea
+  (aerolinea-agente.xml) y devuelve a Copilot el resumen legible + el detalle JSON.
+  Tools: buscar_vuelos, reservar_vuelo, buscar_parking, reservar_parking, pagar_reserva, consultar_reserva.
+  Copilot (su LLM) es quien conversa con el usuario: pregunta lo que falta y decide qué tool usar en cada momento.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+	xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/a2a http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+http://www.mulesoft.org/schema/mule/mcp http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!-- Servidor MCP que consume GitHub Copilot -->
+	<mcp:server-config name="aerolinea-adaptador-mcp-server" doc:name="MCP Server para Copilot" serverName="aerolinea-demo-viajes" serverVersion="${aerolinea.agente.version}">
+		<mcp:streamable-http-server-connection listenerConfig="poc-http-listener" mcpEndpointPath="${poc.rutas.aerolinea.mcpCopilot}" requestTimeout="${poc.timeouts.copilotSegundos}" />
+	</mcp:server-config>
+
+	<!-- Cliente A2A hacia el agente de la aerolínea -->
+	<a2a:client-config name="aerolinea-agente-a2a-client" doc:name="A2A Client agente aerolínea">
+		<a2a:jsonrpc-client-connection agentUrl="http://${poc.host}:${poc.http.puerto}${poc.rutas.aerolinea.agente}" requestTimeout="${poc.timeouts.a2aAerolineaSegundos}">
+			<a2a:default-headers>
+				<a2a:default-header key="X-API-Key" value="${poc.seguridad.apiKey}" />
+			</a2a:default-headers>
+		</a2a:jsonrpc-client-connection>
+	</a2a:client-config>
+
+	<!-- ============================================================================================ -->
+	<!-- Seguridad: solo se abre sesión MCP con la API key de la POC (GitHub Copilot).
+	     Sin API key válida se rechaza con 401 antes de que el cliente pueda listar o invocar tools. -->
+	<!-- ============================================================================================ -->
+	<flow name="aerolinea-adaptador-nueva-sesion-mcp">
+		<mcp:on-new-session-listener doc:name="Nueva sesión MCP" config-ref="aerolinea-adaptador-mcp-server">
+			<mcp:rejection rejectWithStatusCode="#[vars.rechazo.status]" rejectWithMessage="#[vars.rechazo.mensaje]" rejectWithHeaders="#[vars.rechazo.cabeceras]" />
+		</mcp:on-new-session-listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-adaptador-mcp', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[payload.additionalProperties]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: 'sesion-mcp', fase: 'INICIO', mensaje: 'Solicitud de nueva sesión MCP (GitHub Copilot)', datos: {sesionMcp: payload.sessionId, cabeceras: payload.additionalProperties}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-validar-api-key" name="poc-validar-api-key" />
+		<set-variable doc:name="Aceptar o rechazar" variableName="rechazo" value="#[output application/java --- if (vars.autorizacion.valido) null else {status: 401, mensaje: 'No autorizado: ' ++ vars.autorizacion.motivo, cabeceras: {'WWW-Authenticate': 'ApiKey'}}]" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool para Copilot: buscar_vuelos -->
+	<!-- ============================================================================================ -->
+	<flow name="copilot-buscar-vuelos">
+		<mcp:tool-listener doc:name="Tool buscar_vuelos" config-ref="aerolinea-adaptador-mcp-server" name="buscar_vuelos">
+			<mcp:description><![CDATA[Busca vuelos de la aerolínea entre dos ciudades o aeropuertos en una fecha. Úsala cuando el usuario quiera viajar o pida un vuelo ("quiero un vuelo de Madrid a Londres el 20 de noviembre"). Convierte la fecha que diga el usuario a AAAA-MM-DD (si dice "mañana" o un día sin año, calcula la fecha real; si la API responde que la fecha ya pasó, te dirá qué día es hoy). Si falta origen, destino o fecha, pregúntaselo antes de llamar. Devuelve los vuelos con horarios, precios y su vueloId: muéstralos al usuario de forma clara y pídele que elija uno.]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"origen": {
+			"type": "string",
+			"description": "Ciudad o código IATA de origen (p. ej. Madrid o MAD)"
+		},
+		"destino": {
+			"type": "string",
+			"description": "Ciudad o código IATA de destino (p. ej. Londres o LHR)"
+		},
+		"fecha": {
+			"type": "string",
+			"description": "Fecha de salida en formato AAAA-MM-DD"
+		},
+		"pasajeros": {
+			"type": "integer",
+			"minimum": 1,
+			"maximum": 9,
+			"description": "Número de pasajeros (1 si no lo dice)"
+		}
+	},
+	"required": [
+		"origen",
+		"destino",
+		"fecha"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[vars.respuestaAgente.resumen]" />
+				<mcp:text-tool-response-content text="#[write(vars.respuestaAgente.resultado default {}, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#['No se ha podido completar buscar_vuelos: ' ++ (error.description default 'error desconocido') ++ ' (correlationId: ' ++ (vars.correlationId default correlationId) ++ ')']" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-adaptador-mcp', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="copilot-buscar_vuelos" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Petición buscar_vuelos recibida por MCP (GitHub Copilot)', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Acción" variableName="accion" value="buscar_vuelos" />
+		<set-variable doc:name="Datos" variableName="datos" value="#[output application/java --- {origen: payload.origen, destino: payload.destino, fecha: payload.fecha, pasajeros: payload.pasajeros default 1}]" />
+		<flow-ref doc:name="adaptador-enviar-a2a" name="adaptador-enviar-a2a" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool para Copilot: reservar_vuelo -->
+	<!-- ============================================================================================ -->
+	<flow name="copilot-reservar-vuelo">
+		<mcp:tool-listener doc:name="Tool reservar_vuelo" config-ref="aerolinea-adaptador-mcp-server" name="reservar_vuelo">
+			<mcp:description><![CDATA[Reserva el vuelo que ha elegido el usuario (vueloId devuelto por buscar_vuelos). Antes de llamar, pide al usuario el nombre, los apellidos y el email del titular si no los ha dado, y confirma con él el vuelo y el precio. Crea la reserva en estado PENDIENTE_PAGO y devuelve el localizador. Después, ofrece añadir parking de AENA en el aeropuerto de salida o pasar al pago.]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"vueloId": {
+			"type": "string",
+			"description": "vueloId del vuelo elegido, copiado tal cual de buscar_vuelos (p. ej. DA1234_MADLHR_20261120)"
+		},
+		"pasajeros": {
+			"type": "integer",
+			"minimum": 1,
+			"maximum": 9,
+			"description": "Número de pasajeros (el mismo de la búsqueda)"
+		},
+		"nombre": {
+			"type": "string",
+			"description": "Nombre del titular"
+		},
+		"apellidos": {
+			"type": "string",
+			"description": "Apellidos del titular"
+		},
+		"email": {
+			"type": "string",
+			"description": "Email del titular"
+		}
+	},
+	"required": [
+		"vueloId",
+		"nombre",
+		"apellidos",
+		"email"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[vars.respuestaAgente.resumen]" />
+				<mcp:text-tool-response-content text="#[write(vars.respuestaAgente.resultado default {}, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#['No se ha podido completar reservar_vuelo: ' ++ (error.description default 'error desconocido') ++ ' (correlationId: ' ++ (vars.correlationId default correlationId) ++ ')']" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-adaptador-mcp', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="copilot-reservar_vuelo" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Petición reservar_vuelo recibida por MCP (GitHub Copilot)', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Acción" variableName="accion" value="reservar_vuelo" />
+		<set-variable doc:name="Datos" variableName="datos" value="#[output application/java --- {vueloId: payload.vueloId, pasajeros: payload.pasajeros default 1, titular: {nombre: payload.nombre, apellidos: payload.apellidos, email: payload.email}}]" />
+		<flow-ref doc:name="adaptador-enviar-a2a" name="adaptador-enviar-a2a" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool para Copilot: buscar_parking -->
+	<!-- ============================================================================================ -->
+	<flow name="copilot-buscar-parking">
+		<mcp:tool-listener doc:name="Tool buscar_parking" config-ref="aerolinea-adaptador-mcp-server" name="buscar_parking">
+			<mcp:description><![CDATA[Consulta las opciones y precios del parking de AENA en el aeropuerto de salida. Si ya hay reserva, pasa el localizador: el aeropuerto y la fecha de entrada se toman del vuelo. Pregunta al usuario cuándo recogerá el coche (fechaSalida) si no lo ha dicho. Muestra las opciones (EXPRESS, GENERAL, LARGA_ESTANCIA) con su precio y pídele que elija.]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"localizador": {
+			"type": "string",
+			"description": "Localizador de la reserva (6 caracteres) devuelto por reservar_vuelo"
+		},
+		"aeropuerto": {
+			"type": "string",
+			"description": "Aeropuerto AENA donde deja el coche (opcional si hay localizador)"
+		},
+		"fechaEntrada": {
+			"type": "string",
+			"description": "Entrada al parking: AAAA-MM-DD o AAAA-MM-DDTHH:mm (opcional si hay localizador: se usa el día del vuelo)"
+		},
+		"fechaSalida": {
+			"type": "string",
+			"description": "Salida del parking (cuándo recoge el coche): AAAA-MM-DD o AAAA-MM-DDTHH:mm"
+		}
+	},
+	"required": [
+		"fechaSalida"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[vars.respuestaAgente.resumen]" />
+				<mcp:text-tool-response-content text="#[write(vars.respuestaAgente.resultado default {}, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#['No se ha podido completar buscar_parking: ' ++ (error.description default 'error desconocido') ++ ' (correlationId: ' ++ (vars.correlationId default correlationId) ++ ')']" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-adaptador-mcp', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="copilot-buscar_parking" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Petición buscar_parking recibida por MCP (GitHub Copilot)', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Acción" variableName="accion" value="buscar_parking" />
+		<set-variable doc:name="Datos" variableName="datos" value="#[output application/java --- payload]" />
+		<flow-ref doc:name="adaptador-enviar-a2a" name="adaptador-enviar-a2a" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool para Copilot: reservar_parking -->
+	<!-- ============================================================================================ -->
+	<flow name="copilot-reservar-parking">
+		<mcp:tool-listener doc:name="Tool reservar_parking" config-ref="aerolinea-adaptador-mcp-server" name="reservar_parking">
+			<mcp:description><![CDATA[Añade a la reserva del vuelo una plaza de parking de AENA en la opción elegida por el usuario (opcionId de buscar_parking) y recalcula el total. Hay que hacerlo antes de pagar. Usa las mismas fechas que en buscar_parking.]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"localizador": {
+			"type": "string",
+			"description": "Localizador de la reserva (6 caracteres) devuelto por reservar_vuelo"
+		},
+		"opcionId": {
+			"type": "string",
+			"enum": [
+				"EXPRESS",
+				"GENERAL",
+				"LARGA_ESTANCIA"
+			],
+			"description": "Opción de parking elegida"
+		},
+		"fechaSalida": {
+			"type": "string",
+			"description": "Salida del parking (cuándo recoge el coche): AAAA-MM-DD o AAAA-MM-DDTHH:mm"
+		},
+		"fechaEntrada": {
+			"type": "string",
+			"description": "Entrada al parking: AAAA-MM-DD o AAAA-MM-DDTHH:mm (opcional: por defecto el día del vuelo)"
+		},
+		"aeropuerto": {
+			"type": "string",
+			"description": "Aeropuerto AENA (opcional: por defecto el de salida del vuelo)"
+		},
+		"matricula": {
+			"type": "string",
+			"description": "Matrícula del coche (opcional)"
+		}
+	},
+	"required": [
+		"localizador",
+		"opcionId",
+		"fechaSalida"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[vars.respuestaAgente.resumen]" />
+				<mcp:text-tool-response-content text="#[write(vars.respuestaAgente.resultado default {}, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#['No se ha podido completar reservar_parking: ' ++ (error.description default 'error desconocido') ++ ' (correlationId: ' ++ (vars.correlationId default correlationId) ++ ')']" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-adaptador-mcp', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="copilot-reservar_parking" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Petición reservar_parking recibida por MCP (GitHub Copilot)', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Acción" variableName="accion" value="reservar_parking" />
+		<set-variable doc:name="Datos" variableName="datos" value="#[output application/java --- payload]" />
+		<flow-ref doc:name="adaptador-enviar-a2a" name="adaptador-enviar-a2a" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool para Copilot: pagar_reserva -->
+	<!-- ============================================================================================ -->
+	<flow name="copilot-pagar-reserva">
+		<mcp:tool-listener doc:name="Tool pagar_reserva" config-ref="aerolinea-adaptador-mcp-server" name="pagar_reserva">
+			<mcp:description><![CDATA[Genera el enlace de pago (pasarela de AENA) por el total de la reserva: vuelo más parking si lo hay. Confirma antes con el usuario que no quiere añadir nada más. Devuelve una URL: dásela al usuario como enlace para que pague en el navegador y dile que te avise cuando haya pagado.]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"localizador": {
+			"type": "string",
+			"description": "Localizador de la reserva (6 caracteres) devuelto por reservar_vuelo"
+		}
+	},
+	"required": [
+		"localizador"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[vars.respuestaAgente.resumen]" />
+				<mcp:text-tool-response-content text="#[write(vars.respuestaAgente.resultado default {}, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#['No se ha podido completar pagar_reserva: ' ++ (error.description default 'error desconocido') ++ ' (correlationId: ' ++ (vars.correlationId default correlationId) ++ ')']" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-adaptador-mcp', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="copilot-pagar_reserva" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Petición pagar_reserva recibida por MCP (GitHub Copilot)', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Acción" variableName="accion" value="pagar_reserva" />
+		<set-variable doc:name="Datos" variableName="datos" value="#[output application/java --- {localizador: payload.localizador}]" />
+		<flow-ref doc:name="adaptador-enviar-a2a" name="adaptador-enviar-a2a" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- Tool para Copilot: consultar_reserva -->
+	<!-- ============================================================================================ -->
+	<flow name="copilot-consultar-reserva">
+		<mcp:tool-listener doc:name="Tool consultar_reserva" config-ref="aerolinea-adaptador-mcp-server" name="consultar_reserva">
+			<mcp:description><![CDATA[Consulta una reserva por su localizador: vuelo, parking, importes y estado del pago. Si el pago estaba pendiente, comprueba en la pasarela si ya se ha pagado y, si es así, confirma la reserva. Úsala cuando el usuario diga que ya ha pagado o pregunte por su reserva.]]></mcp:description>
+			<mcp:parameters-schema><![CDATA[{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"localizador": {
+			"type": "string",
+			"description": "Localizador de la reserva (6 caracteres) devuelto por reservar_vuelo"
+		}
+	},
+	"required": [
+		"localizador"
+	]
+}]]></mcp:parameters-schema>
+			<mcp:responses>
+				<mcp:text-tool-response-content text="#[vars.respuestaAgente.resumen]" />
+				<mcp:text-tool-response-content text="#[write(vars.respuestaAgente.resultado default {}, 'application/json')]" />
+			</mcp:responses>
+			<mcp:on-error-responses>
+				<mcp:text-tool-response-content text="#['No se ha podido completar consultar_reserva: ' ++ (error.description default 'error desconocido') ++ ' (correlationId: ' ++ (vars.correlationId default correlationId) ++ ')']" />
+			</mcp:on-error-responses>
+		</mcp:tool-listener>
+		<set-variable doc:name="Segmento" variableName="segmento" value="#[{nombre: 'aerolinea-adaptador-mcp', dominio: 'AEROLINEA'}]" />
+		<set-variable doc:name="Cabeceras de entrada" variableName="cabecerasEntrada" value="#[attributes.additionalProperties]" />
+		<flow-ref doc:name="poc-iniciar-trazabilidad" name="poc-iniciar-trazabilidad" />
+		<set-variable doc:name="Paso" variableName="pasoActual" value="copilot-consultar_reserva" />
+		<set-variable doc:name="Log INICIO" variableName="logEvt" value="#[output application/java --- {flujo: flow.name, nivel: 'INFO', paso: vars.pasoActual, fase: 'INICIO', mensaje: 'Petición consultar_reserva recibida por MCP (GitHub Copilot)', datos: {sesionMcp: attributes.sessionId, requestIdMcp: attributes.requestId, cabeceras: attributes.additionalProperties, argumentos: payload}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<flow-ref doc:name="poc-exigir-api-key" name="poc-exigir-api-key" />
+		<set-variable doc:name="Acción" variableName="accion" value="consultar_reserva" />
+		<set-variable doc:name="Datos" variableName="datos" value="#[output application/java --- {localizador: payload.localizador}]" />
+		<flow-ref doc:name="adaptador-enviar-a2a" name="adaptador-enviar-a2a" />
+		<error-handler ref="poc-error-handler" />
+	</flow>
+
+	<!-- ============================================================================================ -->
+	<!-- A2A al agente de la aerolínea. Entrada: vars.accion, vars.datos.                              -->
+	<!-- Salida: vars.respuestaAgente = {estado, resumen, resultado}. Lanza ADAPTADOR:AGENTE_SIN_RESPUESTA
+	     si la Task no termina COMPLETED.                                                             -->
+	<!-- ============================================================================================ -->
+	<sub-flow name="adaptador-enviar-a2a">
+		<set-variable doc:name="Paso" variableName="pasoActual" value="#['a2a-aerolinea-' ++ vars.accion]" />
+		<ee:transform doc:name="Mensaje A2A">
+			<ee:variables>
+				<ee:set-variable variableName="mensajeA2a"><![CDATA[%dw 2.0
+output application/json
+---
+{
+    message: {
+        messageId: uuid(),
+        role: "ROLE_USER",
+        metadata: {
+            correlationId: vars.correlationId,
+            canal: "github-copilot-mcp"
+        },
+        parts: [
+            {
+                data: {accion: vars.accion, datos: vars.datos},
+                mediaType: "application/json"
+            },
+            {
+                text: "Petición del cliente desde GitHub Copilot: " ++ vars.accion
+            }
+        ]
+    }
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<set-variable doc:name="Log LLAMADA_SALIENTE" variableName="logEvt" value="#[output application/java --- {flujo: 'adaptador-enviar-a2a', nivel: 'INFO', paso: vars.pasoActual, fase: 'LLAMADA_SALIENTE', mensaje: 'A2A SendMessage al agente de la aerolínea: ' ++ vars.accion, datos: {accion: vars.accion, datos: vars.datos}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<a2a:send-message doc:name="A2A Send Message (aerolínea)" config-ref="aerolinea-agente-a2a-client" target="respuestaA2a">
+			<a2a:message><![CDATA[#[vars.mensajeA2a]]]></a2a:message>
+			<a2a:additional-properties><![CDATA[#[{'x-correlation-id': vars.correlationId}]]]></a2a:additional-properties>
+		</a2a:send-message>
+		<ee:transform doc:name="Interpretar respuesta A2A">
+			<ee:variables>
+				<ee:set-variable variableName="respuestaAgente"><![CDATA[%dw 2.0
+output application/java
+import * from dwl::comun::utilidades
+var task = taskA2a(vars.respuestaA2a)
+var textoArtifact = primero(flatten((task.artifacts default []) map (($.parts default []) filter ($.text != null) map ($.text as String))))
+---
+{
+    estado: task.status.state default null,
+    taskId: task.id default null,
+    resumen: (textoArtifact default textosDe(task.status.message.parts)) default "",
+    resultado: resultadoNegocio(task.artifacts default vars.respuestaA2a)
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<set-variable doc:name="Log RESPUESTA" variableName="logEvt" value="#[output application/java --- {flujo: 'adaptador-enviar-a2a', nivel: 'INFO', paso: vars.pasoActual, fase: 'RESPUESTA', mensaje: 'Respuesta A2A del agente de la aerolínea: ' ++ (vars.respuestaAgente.estado default 'sin estado'), datos: vars.respuestaAgente}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+		<choice doc:name="¿Completada?">
+			<when expression="#[vars.respuestaAgente.estado != 'TASK_STATE_COMPLETED']">
+				<raise-error doc:name="Sin respuesta" type="ADAPTADOR:AGENTE_SIN_RESPUESTA" description="#['El agente de la aerolínea no ha completado la petición (estado ' ++ (vars.respuestaAgente.estado default 'desconocido') ++ '): ' ++ (vars.respuestaAgente.resumen default '')]" />
+			</when>
+		</choice>
+		<set-variable doc:name="Log FIN" variableName="logEvt" value="#[output application/java --- {flujo: 'adaptador-enviar-a2a', nivel: 'INFO', paso: vars.pasoActual, fase: 'FIN', mensaje: 'Respuesta devuelta a GitHub Copilot', datos: {resumen: vars.respuestaAgente.resumen}}]" />
+		<flow-ref doc:name="poc-log" name="poc-log" />
+	</sub-flow>
+
+</mule>

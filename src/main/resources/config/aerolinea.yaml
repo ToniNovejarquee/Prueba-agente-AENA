@@ -1,0 +1,21 @@
+# =====================================================================================
+#  CONFIGURACIÓN DEL DOMINIO AEROLÍNEA (adaptador MCP, agente, MCP reservas y API reservas)
+# =====================================================================================
+aerolinea:
+
+  agente:
+    nombre: "Agente Aerolinea Demo"
+    version: "1.0.0"
+    organizacion: "Aerolinea Demo"
+    # true: el LLM decide la tool de reservas (con salvaguarda determinista si falla).
+    # false: la tool se llama directamente (demo más rápida, sin depender del LLM).
+    usarLlm: "true"
+    # Reintentos del LLM antes de pasar a la llamada directa a la tool
+    reintentosLlm: "0"
+    # Si el LLM no ejecuta la tool esperada, se llama a la tool directamente (y se registra WARN)
+    fallbackDeterminista: "true"
+
+  negocio:
+    moneda: "EUR"
+    # Código de la compañía (prefijo de los números de vuelo que devuelve el mock de AENA)
+    codigoCompania: "DA"

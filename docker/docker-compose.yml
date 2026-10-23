@@ -1,0 +1,54 @@
+# Micros FastAPI + PostgreSQL de la POC (parte "micros / BBDD" del diagrama)
+#   docker compose up -d --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: poc
+      POSTGRES_PASSWORD: poc
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U poc"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  micro-vuelos:
+    build: ./micros
+    command: uvicorn vuelos.main:app --host 0.0.0.0 --port 8201
+    environment:
+      DATABASE_URL: postgresql+psycopg2://poc:poc@postgres:5432/vuelos
+    ports: ["8201:8201"]
+    depends_on: { postgres: { condition: service_healthy } }
+
+  micro-parking:
+    build: ./micros
+    command: uvicorn parking.main:app --host 0.0.0.0 --port 8202
+    environment:
+      DATABASE_URL: postgresql+psycopg2://poc:poc@postgres:5432/parking
+    ports: ["8202:8202"]
+    depends_on: { postgres: { condition: service_healthy } }
+
+  micro-pagos:
+    build: ./micros
+    command: uvicorn pagos.main:app --host 0.0.0.0 --port 8203
+    environment:
+      DATABASE_URL: postgresql+psycopg2://poc:poc@postgres:5432/pagos
+      PUBLIC_URL: http://localhost:8203
+    ports: ["8203:8203"]
+    depends_on: { postgres: { condition: service_healthy } }
+
+  micro-reservas:
+    build: ./micros
+    command: uvicorn reservas.main:app --host 0.0.0.0 --port 8101
+    environment:
+      DATABASE_URL: postgresql+psycopg2://poc:poc@postgres:5432/reservas
+    ports: ["8101:8101"]
+    depends_on: { postgres: { condition: service_healthy } }
+
+volumes:
+  pgdata:
